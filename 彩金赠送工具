@@ -1,0 +1,2659 @@
+# -*- coding: utf-8 -*-
+import sys, time, random, configparser
+from zoneinfo import ZoneInfo
+import requests
+import openpyxl
+from PyQt5.QtCore import Qt, QRunnable, QThreadPool, QObject, pyqtSignal, QSize, QByteArray
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QTextBrowser, QTextEdit,
+    QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QLineEdit, QPushButton, QLabel, QProgressBar, QFileDialog, QMessageBox, QScrollArea,
+    QCheckBox, QListWidget, QListWidgetItem, QStackedWidget, QFrame, QSizePolicy, QStyledItemDelegate, QComboBox
+)
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtWidgets import QProxyStyle, QStyle
+from datetime import datetime, timedelta, timezone
+from PyQt5.QtGui import QColor, QBrush, QFont
+import json
+
+
+class InstantToolTipStyle(QProxyStyle):
+    def styleHint(self, hint, option=None, widget=None, returnData=None):
+        if hint == QStyle.SH_ToolTip_WakeUpDelay:
+            return 0  # 首次延迟：0ms
+        if hint == QStyle.SH_ToolTip_FallAsleepDelay:
+            return 60000  # 休眠前保持“已唤醒” 60s（按需）
+        return super().styleHint(hint, option, widget, returnData)
+
+
+############################################
+# 1) 复用你现有的 Worker，不改逻辑/签名
+############################################
+
+class WorkerSignals(QObject):
+    progress = pyqtSignal(int)
+    result = pyqtSignal(int, str)  # (row_idx, status)
+    finished = pyqtSignal(list)  # logs
+
+
+class SendGiftWorker(QRunnable):
+    """
+    派送/扣除/扣钻石 子线程：
+    - mode="send"   ：money=0,     gift_money=+金额, need_trade=（外部传：0 或 金额）
+    - mode="deduct" ：money=-金额,  gift_money=0,    need_trade=（外部传：0 或 -金额）
+    - mode="diamond"：item_count=-数量（钻石），不涉及 money/gift_money/need_trade
+    - 统一把接口原始返回归一化：
+        * 成功           -> '成功'
+        * 验证被拒绝     -> '验证被拒绝'
+        * 订单超时/timeout -> '订单超时'
+      不明确时，仅当 confirm_each=True 才轮询确认（你当前只对 “扣除彩金” 传了 True）
+    """
+
+    def __init__(self, rows_data, mode: str = "send",
+                 confirm_each: bool = False, confirm_timeout: int = 15, poll_interval: float = 1.0):
+        super().__init__()
+        self.rows_data = rows_data
+        self.mode = mode
+        self.confirm_each = confirm_each
+        self.confirm_timeout = int(confirm_timeout)
+        self.poll_interval = float(poll_interval)
+        self.signals = WorkerSignals()
+        self.logs = []
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def _extract_port_from_url(self, url: str) -> str:
+        try:
+            after_colon = url.split(':', 2)[2]  # "8080/xxx"
+            return after_colon.split('/')[0]  # "8080"
+        except Exception:
+            return ""
+
+    def _poll_confirm_once(self, session, headers, appid, cjmc, login_code, port) -> bool:
+        """一次轮询确认；由调用方决定是否开启。"""
+        if not port:
+            return False
+        poll_url = f"http://v.boinht.com:{port}/payment_log/list_payment_log"
+        now_ts = int(time.time())
+        payload = {
+            "page_size": 60, "page": 1,
+            "channel_id": "", "open_channel_id": "",
+            "is_pay": "1", "send_item_time": "1",
+            "begin_time": now_ts - 60, "end_time": now_ts + 60,
+            "is_first_recharge": 0, "payment_class_id": "",
+            "nickname": "", "order_id": "", "out_order_id": "",
+            "money_type": 1, "oper_user": "",
+            "content": cjmc, "content2": "", "content_list": "",
+            "min_money": "", "max_money": "",
+            "login_code": login_code, "user_id": appid,
+        }
+        try:
+            r = session.post(poll_url, data=payload, headers=headers, timeout=(5, 10))
+            if r.status_code == 200:
+                result = r.json().get("result", []) or []
+                return bool(result)
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _map_immediate_status(js, raw_status: str):
+        """
+        统一解析接口即时返回：
+        返回：'成功' / '验证被拒绝' / '订单超时' / None(不明确)
+        """
+        msg_text, code_val = "", None
+        if isinstance(js, dict):
+            code_val = js.get("code")
+            msg_text = str(js.get("msg", "") or "")
+        else:
+            msg_text = str(raw_status or "")
+        msg_l = msg_text.lower()
+
+        if code_val == 0 or ("成功" in msg_text and "失败" not in msg_text):
+            return "成功"
+        if ("验证被拒绝" in msg_text) or ("被拒绝" in msg_text) or ("拒绝" in msg_text) or ("reject" in msg_l) or (
+                "rejected" in msg_l):
+            return "验证被拒绝"
+        if ("订单超时" in msg_text) or ("超时" in msg_text) or ("timeout" in msg_l):
+            return "订单超时"
+        return None
+
+    def run(self):
+        session = requests.Session()
+        try:
+            for index, (row_idx, appid, amount, liushui, login_code, cjmc, headers, url, group_name) in enumerate(
+                    self.rows_data):
+                if not self.is_running:
+                    break
+
+                # 统一把 amount 转正（Excel 一律填正数）
+                try:
+                    amt_num = int(float(str(amount)))
+                    if amt_num < 0:
+                        amt_num = abs(amt_num)
+                except Exception:
+                    amt_num = 0
+
+                # === 构造 data ===
+                if self.mode == "send":
+                    data = {
+                        "app_user_id": appid,
+                        "money": "0",
+                        "vip": "0",
+                        "gift_money": str(amt_num),
+                        "content": cjmc,
+                        "password": "",
+                        "need_trade": str(liushui),  # 0 或 金额
+                        "login_code": login_code,
+                    }
+                elif self.mode == "deduct":
+                    data = {
+                        "app_user_id": appid,
+                        "money": f"-{amt_num}",
+                        "vip": "0",
+                        "gift_money": "0",
+                        "content": cjmc,
+                        "password": "",
+                        "need_trade": str(liushui),  # 0 或 -金额
+                        "login_code": login_code,
+                    }
+                else:  # "diamond"
+                    data = {
+                        "item_id": "3",
+                        "user_id": appid,
+                        "item_count": f"-{amt_num}",
+                        "password": "",
+                        "desc": cjmc,
+                        "login_code": login_code,
+                    }
+
+                # === 发送 ===
+                js = None
+                try:
+                    resp = session.post(url, headers=headers, data=data, timeout=(10, 60))
+                    try:
+                        js = resp.json()
+                        if isinstance(js, dict) and "code" in js:
+                            raw_status = "成功" if js.get("code") == 0 else (js.get("msg", "") or "失败")
+                        else:
+                            msg = js.get('msg', '') if isinstance(js, dict) else ''
+                            raw_status = msg or '成功'
+                    except Exception:
+                        raw_status = (resp.text or '').strip() or '接口无返回'
+                except Exception as e:
+                    raw_status = f"请求失败: {e}"
+
+                # === 统一即时结果判断（三种模式相同）===
+                immediate = self._map_immediate_status(js, raw_status)
+
+                # 默认文案（用于不明确时）
+                fail_text = "赠送失败" if self.mode == "send" else ("扣除失败" if self.mode == "deduct" else "扣钻失败")
+                display_status = immediate if immediate else (
+                ("成功" if ("成功" in raw_status and "失败" not in raw_status) else fail_text))
+
+                # 是否需要轮询确认（仅当调用方传了 confirm_each=True 且即时结果不明确）
+                if (self.confirm_each is True) and (immediate is None) and self.is_running:
+                    port = self._extract_port_from_url(url)
+                    deadline = time.time() + self.confirm_timeout
+                    confirmed = False
+                    while self.is_running and time.time() < deadline:
+                        if self._poll_confirm_once(session, headers, appid, cjmc, login_code, port):
+                            confirmed = True
+                            break
+                        time.sleep(max(0.2, float(self.poll_interval)))
+                    display_status = "成功" if confirmed else "订单超时"
+
+                # === 回写 UI 与日志 ===
+                log_entry = f"{group_name} | {appid} | {amount} | {cjmc} | {liushui} | {display_status}"
+                self.logs.append(log_entry)
+                self.signals.result.emit(row_idx, display_status)
+
+                if not self.is_running:
+                    break
+
+                # 仅赠送模式限速；扣除彩金/扣钻石不做额外 sleep（保持你原来的并发/串行策略）
+                if self.mode == "send":
+                    total_sleep = random.uniform(1, 3)
+                    chunk = total_sleep / 10
+                    for _ in range(10):
+                        if not self.is_running:
+                            break
+                        time.sleep(chunk)
+
+                if not self.is_running:
+                    break
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+            self.signals.finished.emit(self.logs)
+
+
+class RecheckPaymentWorker(QRunnable):
+    """
+    原样复用你的复核子线程
+    """
+
+    def __init__(self, items, begin_ts: int, end_ts: int, retries: int = 3, delay_seconds: float = 5.0):
+        super().__init__()
+        self.items = items
+        self.begin_ts = int(begin_ts)
+        self.end_ts = int(end_ts)
+        self.retries = int(retries)
+        self.delay_seconds = float(delay_seconds)
+        self.signals = WorkerSignals()
+        self.logs = []
+        self.is_running = True
+
+    def stop(self):
+        self.is_running = False
+
+    def run(self):
+        session = requests.Session()
+        try:
+            for it in self.items:
+                if not self.is_running:
+                    break
+
+                row_idx = it["row_idx"]
+                appid = it["appid"]
+                cjmc = it["cjmc"]
+                code = it["code"]
+                port = it["port"]
+                headers = it["headers"]
+                group = it["group"]
+
+                url = f"http://v.boinht.com:{port}/payment_log/list_payment_log"
+                payload = {
+                    "page_size": 60,
+                    "page": 1,
+                    "channel_id": "",
+                    "open_channel_id": "",
+                    "is_pay": "1",
+                    "send_item_time": "1",
+                    "begin_time": self.begin_ts,
+                    "end_time": self.end_ts,
+                    "is_first_recharge": 0,
+                    "payment_class_id": "",
+                    "nickname": "",
+                    "order_id": "",
+                    "out_order_id": "",
+                    "money_type": 1,
+                    "oper_user": "",
+                    "content": cjmc,
+                    "content2": "",
+                    "content_list": "",
+                    "min_money": "",
+                    "max_money": "",
+                    "login_code": code,
+                    "user_id": appid,
+                }
+
+                found = False
+                for attempt in range(1, self.retries + 1):
+                    if not self.is_running:
+                        break
+
+                    try:
+                        resp = session.post(url, data=payload, headers=headers, timeout=(5, 10))
+                        if resp.status_code == 200:
+                            result = resp.json().get("result", [])
+                            if result:
+                                found = True
+                                break
+                    except Exception:
+                        pass
+
+                    # 分段等待，可中断
+                    wait = self.delay_seconds
+                    chunk = max(0.2, wait / 10.0)
+                    t = 0.0
+                    while t < wait and self.is_running:
+                        time.sleep(chunk)
+                        t += chunk
+
+                final_status = "复核有记录" if found else f"复核{self.retries}次仍失败"
+                self.signals.result.emit(row_idx, final_status)
+                self.logs.append(f"{group} | {appid} | {cjmc} | {final_status}")
+
+                if not self.is_running:
+                    break
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+            self.signals.finished.emit(self.logs)
+
+
+class MailWorkerSignals(QObject):
+    progress = pyqtSignal(str, int, int)  # (group_name, sent_count, total_count)
+    result = pyqtSignal(str, str)  # (group_name, status_text)
+    finished = pyqtSignal(list)  # logs(list[str])
+
+
+class SendMailWorker(QRunnable):
+    """
+    每个小组一个 worker，串行按批(<=1000)发送
+    使用新接口：/kefu/save_secretary_task_by_admin
+    """
+    SEND_DELAY_SECONDS = 60
+    EXPIRE_DAYS = 7  # 默认值，实例化时可被传入的 expire_days 覆盖
+
+    def __init__(self, group_name: str, appids: list, content: str, port: str, login_code: str, token: str, expire_days: int = None):
+        super().__init__()
+        self.group = group_name
+        self.appids = [str(x).strip() for x in appids if str(x).strip()]
+        self.content = content or ""
+        self.port = str(port or "").strip()
+        self.login_code = str(login_code or "").strip()
+        self.token = str(token or "").strip()
+        self.signals = MailWorkerSignals()
+        self.is_running = True
+        self.logs = []
+        # ✅ 保存本次任务的有效期天数
+        self.expire_days = int(expire_days) if expire_days else self.EXPIRE_DAYS
+
+    def stop(self):
+        self.is_running = False
+
+    def _build_payload(self, user_ids_csv: str):
+        """
+        - send_at = 当前时间 + SEND_DELAY_SECONDS
+        - expire_at = 当前时间 + expire_days 天
+        """
+        now = int(time.time())
+        send_at = now + self.SEND_DELAY_SECONDS
+        expire_at = now + self.expire_days * 24 * 60 * 60
+
+        delta = [{"insert": f"{self.content}\n"}]
+        content_delta_str = json.dumps(delta, ensure_ascii=False)
+
+        payload = {
+            "send_at": send_at,
+            "expire_at": expire_at,
+            "channel_id": self.group,
+            "user_ids": user_ids_csv,
+            "remark": "系统邮件",
+            "urls": "",
+            "attachment_ids": "",
+            "content": content_delta_str,
+            "content_text": self.content,
+            "login_code": self.login_code,
+        }
+        return payload
+
+
+    def run(self):
+        session = requests.Session()
+        try:
+            total = len(self.appids)
+            sent = 0
+            url = f"http://v.boinht.com:{self.port}/kefu/save_secretary_task_by_admin"
+            headers = {"Cookie": f"token={self.token}"}
+
+            # 分批：每批最多 1000 个
+            BATCH = 2000
+            for i in range(0, total, BATCH):
+                if not self.is_running:
+                    break
+
+                batch_list = self.appids[i:i + BATCH]
+                user_ids_csv = ",".join(batch_list)
+                payload = self._build_payload(user_ids_csv)
+
+                status_text = ""
+                try:
+                    resp = session.post(url, data=payload, headers=headers, timeout=(10, 60), verify=False)
+                    try:
+                        js = resp.json()
+                    except Exception:
+                        js = None
+
+                    if isinstance(js, dict):
+                        code = js.get("code")
+                        msg = js.get("msg", "")
+                        if code == 0:
+                            status_text = "成功"
+                        else:
+                            status_text = f"失败：{msg or (resp.text or '')[:200]}"
+                    else:
+                        # 兜底：纯文本成功判断
+                        txt = (resp.text or "").strip()
+                        status_text = "成功" if '"code":0' in txt.replace(" ", "") else f"失败：{txt[:200]}"
+
+                except Exception as e:
+                    status_text = f"失败：请求异常 {e}"
+
+                # 批次日志，携带 uids，用于导出时展开
+                uids_csv = ",".join(batch_list)
+                self.logs.append(
+                    f"{self.group} | batch={i // BATCH + 1} | size={len(batch_list)} | uids={uids_csv} | {status_text}"
+                )
+
+                # 进度
+                if status_text.startswith("成功"):
+                    sent += len(batch_list)
+                # 发进度信号（每批）
+                self.signals.progress.emit(self.group, sent, total)
+
+                if not self.is_running:
+                    break
+
+            # 汇总结果
+            final = "成功" if sent == total else f"部分/失败：{sent}/{total}"
+            self.signals.result.emit(self.group, final)
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+            self.signals.finished.emit(self.logs)
+
+
+############################################
+# 2) 工具函数：配置 & 通用
+############################################
+
+def load_group_names_from_config():
+    cfg = configparser.ConfigParser()
+    cfg.read('config.ini', encoding='utf-8')
+
+    names = []
+    if cfg.has_section('GROUP_COOKIES'):
+        names = list(cfg['GROUP_COOKIES'].keys())
+
+    if not names and cfg.has_section('settings'):
+        s = cfg['settings']
+        if 'groups' in s:
+            names += [g.strip() for g in s['groups'].split(',') if g.strip()]
+        for key in s:
+            if key.startswith('cookie_'):
+                names.append(key[len('cookie_'):])
+        names = list(dict.fromkeys(names))
+
+    if not names:
+        names = ['lvcha', 'yaoji', 'sejie', 'aisebo', 'xingf', 'shaonv', 'renqi', 'lemi', 'cshuang']
+
+    return names
+
+
+def read_common_and_cookies():
+    """从 config.ini 读取 [COMMON] 与 [GROUP_COOKIES]"""
+    cfg = configparser.ConfigParser()
+    cfg.read('config.ini', encoding='utf-8')
+    common = {'port': '', 'code': ''}
+    cookies = {}
+    if cfg.has_section('COMMON'):
+        common['port'] = cfg['COMMON'].get('port', '').strip()
+        common['code'] = cfg['COMMON'].get('code', '').strip()
+    if cfg.has_section('GROUP_COOKIES'):
+        for k, v in cfg['GROUP_COOKIES'].items():
+            cookies[k] = v.strip()
+    return common, cookies
+
+
+def save_log_to_excel(logs, mode: str = "send"):
+    """
+    导出日志：
+    - send   ：工作簿名/表头使用【赠送彩金】；含「复核有记录」「失败记录」
+    - deduct ：工作簿名/表头使用【扣除彩金】；含「复核有记录」「失败记录」
+    - diamond：工作簿名/表头使用【扣除钻石】；仅「失败记录」（不复核、无流水）
+    - mail   ：仅用于“小秘书”发送结果；两个工作表【派送日志】【失败记录】
+               日志格式：group | batch=N | size=K | 状态
+    """
+    try:
+        from openpyxl import Workbook
+        import time
+
+        timestamp = time.strftime("%Y年%m月%d日%H时%M分%S秒")
+
+        # === 邮件日志（运行时按批，导出按 APPID 展开）===
+        if mode == "mail":
+            wb = Workbook()
+            ws_all = wb.active
+            ws_all.title = "派送日志"
+            ws_all.append(["小组", "APPID", "状态"])
+
+            ws_fail = wb.create_sheet("失败记录")
+            ws_fail.append(["小组", "APPID", "状态"])
+
+            for line in logs or []:
+                # 支持两种格式：
+                #  A) 批次行： group | batch=N | size=K | uids=1,2,3 | 状态
+                #  B) 逐人行： group | appid | 状态（向后兼容）
+                parts = [x.strip() for x in str(line).split("|")]
+
+                if len(parts) >= 5 and parts[3].startswith("uids="):
+                    group = parts[0]
+                    # uids=后面的整串
+                    uids_csv = parts[3].split("=", 1)[1].strip()
+                    status = parts[4]
+                    uids = [u.strip() for u in uids_csv.split(",") if u.strip()]
+                    for uid in uids:
+                        try:
+                            uid_val = int(uid)
+                        except Exception:
+                            uid_val = uid
+                        ws_all.append([group, uid_val, status])
+                        if not str(status).startswith("成功"):
+                            ws_fail.append([group, uid_val, status])
+
+                elif len(parts) >= 3:
+                    group, appid, status = parts[:3]
+                    try:
+                        appid_val = int(appid)
+                    except Exception:
+                        appid_val = appid
+                    ws_all.append([group, appid_val, status])
+                    if not str(status).startswith("成功"):
+                        ws_fail.append([group, appid_val, status])
+
+                # 其他格式忽略
+
+            filename = f"小秘书发布日志_{timestamp}.xlsx"
+            wb.save(filename)
+            return filename
+
+        # === 下面保留你原有的三种派送/扣除/钻石 ===
+        if mode == "send":
+            amount_col = "赠送金额"
+            desc_col = "彩金名称"
+            book_title = "赠送彩金日志"
+            with_liushui = True
+        elif mode == "deduct":
+            amount_col = "扣除金额"
+            desc_col = "彩金名称"
+            book_title = "扣除彩金日志"
+            with_liushui = True
+        else:  # diamond
+            amount_col = "扣除钻石"
+            desc_col = "备注"
+            book_title = "扣除钻石日志"
+            with_liushui = False  # 钻石不涉及流水/复核
+
+        wb = Workbook()
+
+        # 工作表1：全部日志（派送日志）
+        ws_all = wb.active
+        ws_all.title = book_title
+        if with_liushui:
+            ws_all.append(['小组', 'APPID', amount_col, desc_col, '流水', '状态'])
+        else:
+            ws_all.append(['小组', 'APPID', amount_col, desc_col, '状态'])
+
+        # 工作表2（send/deduct）：复核有记录
+        ws_recovered = None
+        if with_liushui:
+            ws_recovered = wb.create_sheet("复核有记录")
+            ws_recovered.append(['小组', 'APPID', amount_col, desc_col, '流水', '派送状态', '复核状态'])
+
+        # 工作表最后：失败记录
+        ws_fail = wb.create_sheet("失败记录")
+        if with_liushui:
+            ws_fail.append(['小组', 'APPID', amount_col, desc_col, '流水', '状态'])
+        else:
+            ws_fail.append(['小组', 'APPID', amount_col, desc_col, '状态'])
+
+        # === 复核映射（仅 send/deduct 用）===
+        recheck_map = {}
+        if with_liushui:
+            for log in logs or []:
+                parts = [x.strip() for x in str(log).split('|')]
+                if len(parts) == 4:
+                    group, appid, cjmc, re_status = parts
+                    recheck_map[(group, str(appid), cjmc)] = re_status
+
+        # ——通用解析：容忍 6 段或 5 段（个别实现可能不含“流水”占位）——
+        def parse_send_line(line: str):
+            p = [x.strip() for x in str(line).split('|')]
+            if len(p) >= 6:
+                group, appid, amount, cjmc, liushui, status = p[:6]
+            elif len(p) == 5:
+                group, appid, amount, cjmc, status = p
+                liushui = ""  # 钻石模式可能无占位
+            else:
+                return None
+            return group, appid, amount, cjmc, liushui, status
+
+        def _to_int(x, default=0):
+            try:
+                return int(float(str(x)))
+            except Exception:
+                return default
+
+        send_keys_seen = set()
+
+        for log in logs or []:
+            parsed = parse_send_line(log)
+            if not parsed:
+                continue
+
+            group, appid, amount, cjmc, liushui, status = parsed
+
+            appid_value = appid
+            try:
+                appid_value = int(appid)
+            except Exception:
+                pass
+            amount_value = _to_int(amount, 0)
+            liushui_value = _to_int(liushui, 0)
+
+            # ① 全部日志
+            if with_liushui:
+                ws_all.append([group, appid_value, amount_value, cjmc, liushui_value, status])
+            else:
+                ws_all.append([group, appid_value, amount_value, cjmc, status])
+
+            # ② 失败日志
+            norm_status = (status or "").strip()
+            is_success = norm_status.startswith("成功")
+            if not with_liushui:
+                if not is_success:
+                    ws_fail.append([group, appid_value, amount_value, cjmc, norm_status])
+            else:
+                key = (group, str(appid), cjmc)
+                send_keys_seen.add(key)
+                re_status = recheck_map.get(key, "")
+                recovered = (re_status == "复核有记录")
+                still_failed = (not is_success) and (not recovered)
+                if still_failed:
+                    fail_status = re_status or norm_status
+                    ws_fail.append([group, appid_value, amount_value, cjmc, liushui_value, fail_status])
+
+            # ③ send/deduct：复核有记录
+            if with_liushui:
+                key = (group, str(appid), cjmc)
+                re_status = recheck_map.get(key, "")
+                if re_status == "复核有记录":
+                    ws_recovered.append([group, appid_value, amount_value, cjmc, liushui_value, status, re_status])
+
+        # ——补充：只有复核日志、没有派送日志（send/deduct）——
+        if with_liushui:
+            for key, re_status in recheck_map.items():
+                if re_status != "复核有记录":
+                    continue
+                if key not in send_keys_seen:
+                    group, appid, cjmc = key
+                    try:
+                        appid_value = int(appid)
+                    except Exception:
+                        appid_value = appid
+                    ws_recovered.append([group, appid_value, "", cjmc, "", "未找到派送日志", re_status])
+
+        filename = f'{book_title}_{timestamp}.xlsx'
+        wb.save(filename)
+        return filename
+
+    except Exception as e:
+        raise RuntimeError(f"Excel日志保存失败: {e}")
+
+
+############################################
+# 3) 参数配置页
+############################################
+
+
+class ParamsPage(QWidget):
+    """
+    左侧“参数配置”页：上方为可滚动的分组 Cookie，底部为基础参数
+    自动适应宽高，控件随窗口拉伸
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.group_names = load_group_names_from_config()
+        self.group_inputs = {}
+
+        # ===== 读取配置 =====
+        common, cookies = read_common_and_cookies()
+
+        # ===== 分组 Cookie（放进 ScrollArea，随高度自适应） =====
+        cookie_group = QGroupBox("分组 Cookie 参数")
+        cookie_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        grid = QGridLayout()
+        grid.setContentsMargins(12, 8, 12, 12)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        ROWS_PER_COL = 8  # 每列放 8 行，窗口变宽时每列会变宽
+        for i, name in enumerate(self.group_names):
+            edit = QLineEdit()
+            edit.setPlaceholderText(f"请输入 {name} Cookie")
+            edit.setText(cookies.get(name, ''))
+            edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            self.group_inputs[name] = edit
+
+            row = i % ROWS_PER_COL
+            col = i // ROWS_PER_COL
+
+            line = QHBoxLayout()
+            line.setContentsMargins(0, 0, 0, 0)
+            lbl = QLabel(f"{name}：")
+            lbl.setMinimumWidth(64)
+            lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            line.addWidget(lbl)
+            line.addWidget(edit)
+            grid.addLayout(line, row, col)
+
+        # 每列等比拉伸
+        cols = (len(self.group_names) + ROWS_PER_COL - 1) // ROWS_PER_COL
+        for c in range(cols):
+            grid.setColumnStretch(c, 1)
+
+        cookie_group.setLayout(grid)
+
+        # ScrollArea 包裹分组区域
+        cookie_scroll = QScrollArea()
+        cookie_scroll.setWidget(cookie_group)
+        cookie_scroll.setWidgetResizable(True)
+        cookie_scroll.setFrameShape(QFrame.NoFrame)
+        cookie_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        # ===== 基础参数（通用） =====
+        base_group = QGroupBox("基础参数（通用）")
+        base_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.port_input = QLineEdit()
+        self.code_input = QLineEdit()
+        self.save_btn = QPushButton("💾 保存配置")
+
+        self.port_input.setPlaceholderText("请输入端口号，例如：8080")
+        self.port_input.setText(common.get('port', ''))
+        self.code_input.setPlaceholderText("请输入小明计算器登录码")
+        self.code_input.setText(common.get('code', ''))
+
+        # 输入框随宽度拉伸
+        for w in (self.port_input, self.code_input, self.save_btn):
+            w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        base_layout = QVBoxLayout()
+        base_layout.setContentsMargins(12, 8, 12, 12)
+        base_layout.setSpacing(10)
+        base_layout.addLayout(self._pair("🌐 端口号：", self.port_input))
+        base_layout.addLayout(self._pair("🔢 登录码：", self.code_input))
+        base_group.setLayout(base_layout)
+
+        # ===== 页面总布局 =====
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(12)
+        layout.addWidget(cookie_scroll, 1)  # 占据剩余高度，可滚动
+        layout.addWidget(base_group, 0)  # 贴底部，保持内容高度
+
+        layout.addSpacing(16)
+        layout.addWidget(self.save_btn)
+
+        # 信号
+        self.save_btn.clicked.connect(self.save_config)
+
+    def _pair(self, label, widget):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        lbl = QLabel(label)
+        lbl.setMinimumWidth(64)
+        lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row.addWidget(lbl)
+        row.addWidget(widget, 1)
+        return row
+
+    def save_config(self):
+        port = (self.port_input.text() or "").strip()
+        code = (self.code_input.text() or "").strip()
+        if not port or not code:
+            QMessageBox.warning(self, "警告", "请填写完整的配置（端口号 和 小明码）！")
+            return
+
+        cfg = configparser.ConfigParser()
+        cfg['COMMON'] = {'port': port, 'code': code}
+
+        cookies = {}
+        missing = []
+        for name, edit in self.group_inputs.items():
+            token = (edit.text() or "").strip()
+            if token:
+                cookies[name] = token
+                edit.setStyleSheet("")
+            else:
+                missing.append(name)
+                edit.setStyleSheet("border: 1px solid red;")
+        cfg['GROUP_COOKIES'] = cookies
+
+        with open('config.ini', 'w', encoding='utf-8') as f:
+            cfg.write(f)
+
+        if missing:
+            QMessageBox.information(self, "部分保存成功", "配置已保存，但以下小组未填写 Cookie：\n" + "、".join(missing))
+        else:
+            QMessageBox.information(self, "提示", "✅ 配置已完整保存！")
+
+    def set_enabled(self, enabled: bool):
+        """运行中禁用；结束后恢复。"""
+        self.save_btn.setEnabled(enabled)
+        self.port_input.setEnabled(enabled)
+        self.code_input.setEnabled(enabled)
+        for edit in self.group_inputs.values():
+            edit.setEnabled(enabled)
+
+
+############################################
+# 4) 赠送/扣除 共用页面（模式化）
+############################################
+
+class GiftPage(QWidget):
+    """
+    可配置模式的页面：
+    mode: "send"（赠送彩金） / "deduct"（扣除彩金） / "diamond"（扣除钻石）
+    """
+
+    # 新增：发送邮件目标（仅 APPID，按小组分组）
+    mailTargetsReady = pyqtSignal(dict)  # {"组名": ["appid1","appid2", ...]}
+
+    def __init__(self, mode: str = "send", parent=None,
+                 params_page: QWidget = None,  # 新增：参数配置页引用
+                 nav: QListWidget = None,  # 新增：左侧导航引用
+                 nav_params_index: int = 3):  # 新增：“参数配置”在导航中的索引
+        super().__init__(parent)
+        assert mode in ("send", "deduct", "diamond")
+        self.mode = mode
+
+        # 保存引用，供 _set_enabled() 使用
+        self.params_page = params_page
+        self.nav = nav
+        self.nav_params_index = nav_params_index
+
+        # 运行时统计
+        self.total_accounts = 0
+        self.total_amount = 0
+        self.completed_count = 0
+        self.task_finished_called = False
+        self.task_stopped = False
+        self.group_logs = []
+        self.active_workers = []
+        self.finished_workers = 0
+
+        self.threadpool = QThreadPool()
+
+        self.recheck_worker = None  # 当前复核线程引用
+        self.in_recheck = False  # 是否处于复核阶段
+
+        # ===== 表格 =====
+        self.table = QTableWidget()
+        self.table.setColumnCount(5)
+
+        # 表头：按模式分别显示
+        if self.mode == "send":
+            headers = ['小组', 'APPID', '赠送金额', '彩金名称', '状态']
+        elif self.mode == "deduct":
+            headers = ['小组', 'APPID', '扣除金额', '彩金名称', '状态']
+        else:  # diamond
+            headers = ['小组', 'APPID', '扣除钻石', '备注', '状态']
+
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.verticalHeader().setVisible(False)
+
+        # ——状态列：交互宽度 + 默认最小宽度——
+        self._status_col = 4
+        self._status_min_width = 150  # 想更宽就改这个数
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(self._status_col, QHeaderView.Interactive)
+        self.table.setColumnWidth(self._status_col, self._status_min_width)
+
+        # 可选：给所有列一个最小列宽，避免过窄（按需保留）
+        hh.setMinimumSectionSize(80)
+
+        # ===== 功能区 =====
+        self.import_btn = QPushButton("📁 导入appid")
+        self.password_input = QLineEdit()
+        self.password_input.setPlaceholderText("请输入确认密码")
+
+        self.no_code_checkbox = QCheckBox(
+            "无需打码" if self.mode == "send" else ("扣等额打码" if self.mode == "deduct" else "（钻石无需选项）")
+        )
+        if self.mode == "diamond":
+            self.no_code_checkbox.setVisible(False)  # 钻石模式不需要该选项
+
+        self.action_btn = QPushButton(
+            "🚀 派送彩金" if self.mode == "send" else ("⚠️ 扣除彩金" if self.mode == "deduct" else "💎 扣除钻石")
+        )
+        self.stop_btn = QPushButton("🛑 停止执行")
+
+        # ——关键：所有输入/按钮设置为“水平可扩展”——
+        for w in (self.import_btn, self.password_input, self.no_code_checkbox,
+                  self.action_btn, self.stop_btn):
+            w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.action_btn.setMinimumHeight(36)
+        self.stop_btn.setMinimumHeight(36)
+
+        func_group = QGroupBox("功能操作")
+        func_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        # 左列用 Grid：标签列固定，控件列自适应
+        left_grid = QGridLayout()
+        left_grid.setContentsMargins(0, 0, 0, 0)
+        left_grid.setHorizontalSpacing(10)
+        left_grid.setVerticalSpacing(8)
+        left_grid.setColumnStretch(0, 0)  # 标签列
+        left_grid.setColumnStretch(1, 1)  # 输入/按钮列自动扩展
+
+        row_i = 0
+        left_grid.addWidget(self.import_btn, row_i, 0, 1, 2);
+        row_i += 1
+        left_grid.addWidget(QLabel("确认密码："), row_i, 0)
+        left_grid.addWidget(self.password_input, row_i, 1);
+        row_i += 1
+        if self.mode != "diamond":
+            left_grid.addWidget(self.no_code_checkbox, row_i, 0, 1, 2);
+            row_i += 1
+
+        # === 扣除页面的提示条（更明显的“警告”主题）；钻石也给提示 ===
+        if self.mode in ("deduct", "diamond"):
+            if self.mode == "deduct":
+                hint_text = ("导入【扣除金额】一律填正数（如 10），系统提交时会自动按 -10 扣款；"
+                             "未勾选「扣等额打码」→ 流水 = 0；勾选后 → 流水 = -金额。")
+                self.hint_label = self._build_hint_label(hint_text, level="warning")
+            else:  # diamond
+                hint_text = ("导入【扣除钻石】一律填正数（如 10），系统提交时会自动按 -10 扣除；"
+                             "该操作无复核流程。")
+                self.hint_label = self._build_hint_label(hint_text, level="warning")
+
+            left_grid.addWidget(self.hint_label, row_i, 0, 1, 2);
+            row_i += 1
+
+        # 右列：按钮竖排，宽度随容器变化
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(8)
+        right_col.addWidget(self.action_btn)
+        right_col.addWidget(self.stop_btn)
+        right_col.addStretch(1)
+
+        # 顶层：左右两列，设置伸展因子让左列更宽，右列贴右
+        func_layout = QHBoxLayout()
+        func_layout.setContentsMargins(10, 8, 10, 8)
+        func_layout.setSpacing(12)
+        func_layout.addLayout(left_grid, 3)
+        func_layout.addLayout(right_col, 2)
+        func_group.setLayout(func_layout)
+
+        # ===== 统计与进度 =====
+        self.stats_label = QLabel("0 / 0")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+
+        # 主布局
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(self.table)
+        main_layout.addWidget(func_group)  # 铺满底部
+        main_layout.addWidget(self.stats_label)
+        main_layout.addWidget(self.progress_bar)
+        self.setLayout(main_layout)
+
+        # 信号
+        self.import_btn.clicked.connect(self.import_file)
+        self.action_btn.clicked.connect(self.perform_action)
+        self.stop_btn.clicked.connect(self.stop_action)
+        self.no_code_checkbox.stateChanged.connect(self.no_code_toggled)
+
+    def _pair(self, label, widget):
+        h = QHBoxLayout()
+        h.addWidget(QLabel(label))
+        h.addWidget(widget)
+        return h
+
+    def _build_hint_label(self, text: str, level: str = "info") -> QLabel:
+        """创建一条带主题色的提示条：level in {'info','warning'}"""
+        palettes = {
+            "info": {"bg": "#eef6ff", "bd": "#93c5fd", "fg": "#1e3a8a"},  # 浅蓝信息
+            "warning": {"bg": "#fff7ed", "bd": "#fdba74", "fg": "#9a3412"},  # 浅橙警告
+        }
+        p = palettes.get(level, palettes["info"])
+        lbl = QLabel(f"<b>提示：</b>{text}")
+        lbl.setWordWrap(True)
+        lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        lbl.setStyleSheet(
+            f"QLabel {{"
+            f" background:{p['bg']};"
+            f" border:1px solid {p['bd']};"
+            f" color:{p['fg']};"
+            f" border-radius:6px;"
+            f" padding:8px 10px;"
+            f"}}"
+        )
+        return lbl
+
+    def _update_deduct_hint_text(self):
+        """勾选变化时更新扣除提示文案（仅扣除彩金用）"""
+        if not hasattr(self, "hint_label"):
+            return
+        if self.mode == "deduct":
+            if self.no_code_checkbox.isChecked():
+                text = "已勾选「扣等额打码」，流水 = -金额（例如金额 10 → 流水 -10）。"
+            else:
+                text = "未勾选「扣等额打码」，流水 = 0。导入【扣除金额】一律填正数（如 10），系统自动按 -10 扣款。"
+            self.hint_label.setText(f"<b>提示：</b>{text}")
+
+    # =========== UI 行为 ===========
+    def no_code_toggled(self, state):
+        if self.mode == "send":
+            QMessageBox.information(self, "提示",
+                                    "已启用【无需打码】，流水将为 0" if state == Qt.Checked
+                                    else "已关闭【无需打码】，默认打码为赠送金额的一倍")
+        elif self.mode == "deduct":
+            QMessageBox.information(self, "提示",
+                                    "已启用【扣等额打码】，流水 = -金额" if state == Qt.Checked
+                                    else "已关闭【扣等额打码】，流水 = 0")
+        else:
+            pass  # 钻石无此选项
+
+    def _is_recheck_running(self) -> bool:
+        """复核线程是否在运行"""
+        rw = getattr(self, 'recheck_worker', None)
+        return bool(rw and getattr(rw, 'is_running', False))
+
+    def _has_active_workers(self) -> bool:
+        """派送/扣除线程是否在运行"""
+        return any(getattr(w, 'is_running', False) for w in getattr(self, 'active_workers', []))
+
+    def stop_action(self):
+        """仅在确有任务/复核运行时才发出停止指令并改UI（中文按钮：确定/取消）"""
+        from PyQt5.QtWidgets import QMessageBox
+
+        # 先检测是否有需要停止的任务/复核
+        to_stop = []
+        if getattr(self, 'active_workers', None):
+            for w in list(self.active_workers):
+                if getattr(w, 'is_running', False):
+                    to_stop.append(w)
+
+        try:
+            recheck_running = bool(self._is_recheck_running())
+        except Exception:
+            recheck_running = False
+
+        if not to_stop and not recheck_running:
+            QMessageBox.information(self, "提示", "当前没有正在执行的任务。")
+            return
+
+        # 有任务在跑 -> 弹出中文确认对话框
+        box = QMessageBox(self)
+        box.setWindowTitle("确认停止")
+        box.setText("确定要停止当前正在执行的任务吗？\n（进行中的任务会尽快停止）")
+        box.setIcon(QMessageBox.Question)
+        box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        # 改按钮文字为中文
+        box.button(QMessageBox.Yes).setText("确定")
+        box.button(QMessageBox.No).setText("取消")
+        box.setDefaultButton(QMessageBox.Yes)
+        box.exec_()
+        if box.result() != QMessageBox.Yes:
+            return  # 用户取消
+
+        # 停派送/扣除线程
+        for w in to_stop:
+            try:
+                w.stop()
+            except Exception:
+                pass
+
+        # 停复核线程
+        if recheck_running:
+            try:
+                if hasattr(self, "recheck_worker") and self.recheck_worker:
+                    self.recheck_worker.stop()  # 其内部会将 is_running = False
+            except Exception:
+                pass
+
+        # 标记与更新 UI
+        self.task_stopped = True
+
+        # 仅把“待处理”标为“已停止”（不修改已执行/已失败的行）
+        try:
+            if hasattr(self, "table") and self.table is not None:
+                for row in range(self.table.rowCount()):
+                    status_item = self.table.item(row, 4)
+                    if status_item and status_item.text().strip() == '待处理':
+                        status_item.setText('已停止')
+        except Exception:
+            pass
+
+        # 状态提示：区分是否处于复核
+        try:
+            if hasattr(self, "stats_label") and self.stats_label is not None:
+                if recheck_running:
+                    self.stats_label.setText("已发送停止指令（复核），等待任务结束…")
+                else:
+                    self.stats_label.setText("已发送停止指令，等待任务结束…")
+        except Exception:
+            pass
+
+        # 防止重复点击，待 finished 回调里再恢复
+        try:
+            if hasattr(self, "stop_btn") and self.stop_btn is not None:
+                self.stop_btn.setEnabled(False)
+        except Exception:
+            pass
+
+    # ========= 新增：仅收集 APPID 的工具函数 & 发送邮件确认 =========
+    def _build_mail_targets_from_logs(self) -> dict:
+        """
+        采集本次『赠送彩金』执行后的“最终成功口径”账号（用于邮件发送）。
+        来源：当前表格第5列状态（状态为“成功”或“复核有记录”）。
+        仅在 send 模式生效；按小组分组，保留重复与顺序。
+        返回：{"小组A": ["123","123","456"], ...}
+        """
+        targets = {}
+        if self.mode != "send":
+            return targets
+
+        for row in range(self.table.rowCount()):
+            status_item = self.table.item(row, 4)
+            if not status_item:
+                continue
+            status = (status_item.text() or "").strip()
+            if status not in ("成功", "复核有记录"):
+                continue
+
+            group = (self.table.item(row, 0).text() or "").strip()
+            appid = (self.table.item(row, 1).text() or "").strip()
+            if group and appid:
+                # 保留重复，不去重
+                targets.setdefault(group, []).append(appid)
+
+        return targets
+
+    def _maybe_prompt_send_mail(self):
+        """
+        在赠送彩金“真正完成”后调用：
+        1) 组装按组的 APPID 清单；
+        2) 若为空则不动作；
+        3) 弹窗确认；若选择“是”，发射 mailTargetsReady，并切换到“邮件列表”页（索引 3）。
+        """
+        if self.mode != "send":
+            return
+        targets = self._build_mail_targets_from_logs()
+        if not targets:
+            return
+
+        total_accounts = sum(len(v) for v in targets.values())
+        # 自定义按钮文字的询问框
+        msg = QMessageBox(QMessageBox.Question, "发布小秘书",
+                          f"导入账号共 {self.total_accounts} 个，赠送成功 {total_accounts} 个，是否立即进入【小秘书】进行发布？",
+                          QMessageBox.Yes | QMessageBox.No, self)
+        msg.setDefaultButton(QMessageBox.Yes)
+        # 改按钮文本
+        msg.button(QMessageBox.Yes).setText("立即发布小秘书")
+        msg.button(QMessageBox.No).setText("暂不发布")
+
+        ret = msg.exec_()  # 如果是 PyQt6，用 msg.exec()
+        if ret == QMessageBox.Yes:
+            try:
+                self.mailTargetsReady.emit(targets)
+            except Exception:
+                pass
+            try:
+                if getattr(self, "nav", None):
+                    self.nav.setCurrentRow(3)
+            except Exception:
+                pass
+
+    def _prepare_mail_groups_early(self):
+        """
+        在开始派送前，把本次导入中出现过的小组先推给“小秘书”页，
+        仅用于提前生成文本框（APPID 先留空），便于你提前粘贴内容。
+        仅在 send 模式生效。
+        """
+        if self.mode != "send":
+            return
+
+        groups = {}
+        for row in range(self.table.rowCount()):
+            group = (self.table.item(row, 0).text() or "").strip() if self.table.item(row, 0) else ""
+            if group:
+                groups.setdefault(group, [])  # 先不给 APPID，只生成文本框
+
+        if groups and hasattr(self, "mailTargetsReady"):
+            # 触发已有信号：MailListPage.loadTargets 会收到并生成每组文本框
+            self.mailTargetsReady.emit(groups)
+
+    # =========== 导入 ===========
+    def import_file(self):
+        """
+        严格按页面模式校验并导入 Excel：
+        - 赠送彩金：小组 | APPID | 赠送金额 | 彩金名称
+        - 扣除彩金：小组 | APPID | 扣除金额 | 彩金名称
+        - 扣除钻石：小组 | APPID | 扣除钻石 | 备注
+        仅允许模板四列（多一列也会报错并中止）。
+        """
+        path, _ = QFileDialog.getOpenFileName(self, "选择Excel", "", "Excel Files (*.xlsx *.xls)")
+        if not path:
+            return
+
+        # 不同模式下要求的列名
+        if self.mode == "send":
+            amount_col_name = "赠送金额"
+            desc_col_name = "彩金名称"
+        elif self.mode == "deduct":
+            amount_col_name = "扣除金额"
+            desc_col_name = "彩金名称"
+        else:  # diamond
+            amount_col_name = "扣除钻石"
+            desc_col_name = "备注"
+
+        required_headers = ["小组", "APPID", amount_col_name, desc_col_name]
+
+        try:
+            wb = openpyxl.load_workbook(path)
+            sheet = wb.active
+
+            # 读取表头
+            raw_headers = [cell.value for cell in sheet[1]]
+            headers = [str(h).strip() if h is not None else "" for h in raw_headers]
+
+            # === 新增：仅允许模板四列（非空表头必须恰好 4 个，且集合必须与 required_headers 相同）===
+            nonempty_headers = [h for h in headers if h]  # 只统计有名字的列
+            if len(nonempty_headers) != 4:
+                QMessageBox.critical(
+                    self, "错误",
+                    "模板必须仅包含 4 列：{}\n当前检测到的表头为：{}".format(
+                        "、".join(required_headers),
+                        "、".join(nonempty_headers) if nonempty_headers else "（无）"
+                    )
+                )
+                return
+            if set(nonempty_headers) != set(required_headers):
+                QMessageBox.critical(
+                    self, "错误",
+                    "表头不匹配。\n应为：{}\n实际：{}".format(
+                        "、".join(required_headers),
+                        "、".join(nonempty_headers)
+                    )
+                )
+                return
+            # === 校验通过，定位列（不要求顺序一致）===
+            try:
+                group_idx = headers.index("小组")
+                appid_idx = headers.index("APPID")
+                amount_idx = headers.index(amount_col_name)
+                desc_idx = headers.index(desc_col_name)
+            except ValueError:
+                QMessageBox.critical(self, "错误", "无法定位模板列，请检查第一行表头是否正确。")
+                return
+
+            # 同步表格列头显示
+            self.table.setHorizontalHeaderLabels(['小组', 'APPID', amount_col_name, desc_col_name, '状态'])
+
+            # 清空并开始导入
+            self.table.setRowCount(0)
+            total_amount = 0
+            allowed_groups = load_group_names_from_config()
+
+            for row_idx, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+                # 取值与清洗
+                def _get(idx):
+                    val = row[idx] if idx < len(row) else None
+                    if isinstance(val, str):
+                        return val.strip()
+                    return val
+
+                group_name = _get(group_idx) or ""
+                appid_val = _get(appid_idx)
+                amount_val = _get(amount_idx)
+                desc_val = _get(desc_idx) or ""
+
+                # 基础校验（保持你原来的风格）
+                if not group_name:
+                    QMessageBox.critical(self, "错误", f"第 {row_idx} 行的小组名称为空，请检查")
+                    return
+                if not appid_val:
+                    QMessageBox.critical(self, "错误", f"第 {row_idx} 行的 APPID 为空，请检查")
+                    return
+                # 保持原有“转整数”的处理逻辑（允许 1、1.0、1,000；1.1 会被转成 1）
+                try:
+                    amt_str = str(amount_val).replace(",", "").strip()
+                    amt_int = int(float(amt_str))
+                    if amt_int <= 0:
+                        QMessageBox.critical(self, "错误", f"第 {row_idx} 行的金额/数量必须大于 0，请检查")
+                        return
+                except Exception:
+                    QMessageBox.critical(self, "错误", f"第 {row_idx} 行的金额/数量格式错误，请检查")
+                    return
+                if not desc_val:
+                    QMessageBox.critical(self, "错误", f"第 {row_idx} 行的{desc_col_name}为空，请检查")
+                    return
+                if group_name not in allowed_groups:
+                    QMessageBox.critical(self, "错误",
+                                         f"第 {row_idx} 行的小组 '{group_name}' 未在【参数配置】中出现，请先填写该组 Cookie")
+                    return
+
+                appid_str = str(appid_val).strip()
+
+                # 写入表格
+                cur = self.table.rowCount()
+                self.table.insertRow(cur)
+                for col, val in enumerate([group_name, appid_str, str(amt_int), desc_val, '待处理']):
+                    item = QTableWidgetItem(str(val))
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    self.table.setItem(cur, col, item)
+
+                total_amount += amt_int
+
+            # 统计与进度
+            self.total_accounts = self.table.rowCount()
+            self.total_amount = int(total_amount)
+            self.completed_count = 0
+            self.stats_label.setText(f"{self.total_accounts} / {self.total_amount}（已完成{self.completed_count}个）")
+            self.progress_bar.setMaximum(self.total_accounts if self.total_accounts > 0 else 1)
+            self.progress_bar.setValue(0)
+
+            QMessageBox.information(self, "成功", f"成功导入 {self.total_accounts} 个账号")
+            # >>> 生成邮件文本框：
+            self._prepare_mail_groups_early()
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导入失败: {str(e)}")
+
+    # =========== 执行 ===========
+    def perform_action(self):
+        self.task_stopped = False
+        password = (self.password_input.text() or "").strip()
+        if password != '6666':
+            QMessageBox.warning(self, "警告", "请输入正确的确认密码")
+            return
+
+        common, cookies = read_common_and_cookies()
+        port = (common.get('port') or '').strip()
+        login_code = (common.get('code') or '').strip()
+        if not port or not login_code:
+            QMessageBox.warning(self, "警告", "请先到【参数配置】填写完整参数并保存")
+            return
+
+        # ① 未导入账号时的提示
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "提示", "未导入账号，请先导入 Excel。")
+            return
+
+        rows_data = []
+        checked = self.no_code_checkbox.isChecked() if self.mode != "diamond" else False
+
+        pending_total = 0  # 记录“待处理”的行数
+        missing_cookie_groups = set()  # 记录待处理但缺 Cookie 的小组
+
+        for row in range(self.table.rowCount()):
+            item_status = self.table.item(row, 4)
+            if not item_status or item_status.text() != '待处理':
+                continue
+
+            pending_total += 1
+
+            group_name = (self.table.item(row, 0).text() or "").strip()
+            appid = (self.table.item(row, 1).text() or "").strip()
+            amount_text = (self.table.item(row, 2).text() or "").strip()
+            cjmc = (self.table.item(row, 3).text() or "").strip()
+
+            try:
+                amount_int = int(float(amount_text))
+            except Exception:
+                amount_int = 0
+
+            token = (cookies.get(group_name, "") or "").strip()
+            if not token:
+                # 记录该小组缺 Cookie，后面统一提示
+                missing_cookie_groups.add(group_name)
+                continue
+
+            if self.mode == "send":
+                liushui_value = '0' if checked else str(amount_int)
+                url = f"http://v.boinht.com:{port}/pp_recharge/manual_recharge"
+            elif self.mode == "deduct":
+                liushui_value = f"-{amount_int}" if checked else '0'
+                url = f"http://v.boinht.com:{port}/pp_recharge/manual_recharge"
+            else:  # diamond
+                liushui_value = '0'  # 占位，不用于接口
+                url = f"http://v.boinht.com:{port}/item/manual_send_item"
+
+            headers = {'Cookie': f'token={token}'}
+            rows_data.append((row, appid, amount_text, liushui_value, login_code, cjmc, headers, url, group_name))
+
+        # ② 已导入但“没有待处理”的提示（避免重复派送）
+        if pending_total == 0:
+            QMessageBox.information(self, "提示", "没有待处理的账号，请勿重复派送。")
+            return
+
+        # ③ 有待处理但因未配置 Cookie 导致无法执行的提示
+        if not rows_data:
+            if missing_cookie_groups:
+                groups = "、".join(sorted(g for g in missing_cookie_groups if g))
+                msg = f"存在待处理账号，但以下小组未配置 Cookie，无法执行：{groups or '（未命名小组）'}\n请到【参数配置】填写并保存 Cookie。"
+            else:
+                msg = "存在待处理账号，但缺少必要参数，无法执行。"
+            QMessageBox.information(self, "提示", msg)
+            return
+
+        # 禁用交互 & 初始化统计（原样保留）
+        self._set_enabled(False)
+        self.task_finished_called = False
+        self.completed_count = 0
+        self.finished_workers = 0
+        self.total_accounts = len(rows_data)
+        self.total_amount = int(sum(self._safe_float(d[2]) for d in rows_data))
+        self.stats_label.setText(f"{self.total_accounts} / {self.total_amount}（已完成0个）")
+        self.progress_bar.setMaximum(self.total_accounts)
+        self.progress_bar.setValue(0)
+
+        self.group_logs = []
+        self.active_workers = []
+
+        if self.mode == "send":
+            # 赠送：维持按小组并发
+            from collections import defaultdict  # 防止外部未导入时 NameError
+            grouped = defaultdict(list)
+            for d in rows_data:
+                grouped[d[-1]].append(d)
+            for _, group_rows in grouped.items():
+                worker = SendGiftWorker(group_rows, mode="send")
+                worker.signals.result.connect(self.update_table_status)
+                worker.signals.finished.connect(self.on_task_finished)
+                self.active_workers.append(worker)
+                self.threadpool.start(worker)
+        elif self.mode == "deduct":
+            # 扣除彩金：单 worker 串行 + 每单确认
+            worker = SendGiftWorker(rows_data, mode="deduct", confirm_each=True, confirm_timeout=15, poll_interval=1.0)
+            worker.signals.result.connect(self.update_table_status)
+            worker.signals.finished.connect(self.on_task_finished)
+            self.active_workers.append(worker)
+            self.threadpool.start(worker)
+        else:
+            # 扣除钻石：单 worker 串行，不复核、不额外sleep
+            worker = SendGiftWorker(rows_data, mode="diamond")
+            worker.signals.result.connect(self.update_table_status)
+            worker.signals.finished.connect(self.on_task_finished)
+            self.active_workers.append(worker)
+            self.threadpool.start(worker)
+
+    def _safe_float(self, x):
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    def _set_enabled(self, enabled: bool):
+        # 原来这几行保留
+        self.import_btn.setEnabled(enabled)
+        self.action_btn.setEnabled(enabled)
+        self.password_input.setEnabled(enabled)
+        if self.mode != "diamond":
+            self.no_code_checkbox.setEnabled(enabled)
+
+        # 新增：锁/解锁 参数配置页
+        if self.params_page is not None and hasattr(self.params_page, "set_enabled"):
+            self.params_page.set_enabled(enabled)
+
+        # 可选：锁/解锁左侧“参数配置”导航项（索引按你的顺序来）
+        if self.nav is not None and self.nav_params_index is not None:
+            item = self.nav.item(self.nav_params_index)
+            if item:
+                flags = item.flags()
+                if enabled:
+                    item.setFlags(flags | Qt.ItemIsEnabled)
+                else:
+                    item.setFlags(flags & ~Qt.ItemIsEnabled)
+
+    def _paint_status(self, item, text: str, final: bool = False):  # 新增：状态着色
+        t = (text or "").strip()
+
+        # 1) 基线字体：只初始化一次，避免重复 +1 导致越刷越大
+        base = getattr(self, "_status_base_font", None)
+        if base is None:
+            base = QFont("Microsoft YaHei")  # 统一微软雅黑
+            # 用表格默认字号作为基准，再固定 +1
+            ps = self.table.font().pointSize()
+            if ps <= 0:
+                ps = 12
+            base.setPointSize(ps + 1)
+            setattr(self, "_status_base_font", base)
+
+        # 每次都从基线拷贝，保证不累加
+        font = QFont(base)
+
+        # 2) 颜色 & 加粗
+        if "成功" in t:
+            fg = QColor("#2ECC71")  # 绿
+            font.setBold(True)
+        elif "复核有记录" in t:
+            fg = QColor("#F39C12").darker(110)  # 深橙
+            font.setBold(True)
+        elif t in ("待处理", ""):
+            fg = QColor("#95A5A6")  # 灰
+            font.setBold(False)
+        else:
+            fg = QColor("#E74C3C")  # 红
+            font.setBold(True)
+
+        # 3) 应用
+        item.setFont(font)
+        item.setForeground(QBrush(fg))
+
+    # =========== 子线程回调 ===========
+    def update_table_status(self, row_idx, status_text):
+        if 0 <= row_idx < self.table.rowCount():
+            status_col = getattr(self, "_status_col", 4)
+            minw = getattr(self, "_status_min_width", 150)
+
+            item = QTableWidgetItem(status_text)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            # NEW: 着色
+            if hasattr(self, "_paint_status"):
+                self._paint_status(item, status_text)
+
+            self.table.setItem(row_idx, status_col, item)
+            self.table.scrollToItem(item, QAbstractItemView.PositionAtBottom)
+
+            self.completed_count += 1
+            self.stats_label.setText(f"{self.total_accounts} / {self.total_amount}（已完成{self.completed_count}个）")
+            self.progress_bar.setValue(self.completed_count)
+
+            # 状态列：按内容自适应，但不少于 minw
+            self.table.resizeColumnToContents(status_col)
+            if self.table.columnWidth(status_col) < minw:
+                self.table.setColumnWidth(status_col, minw)
+
+    def on_task_finished(self, logs):
+        self.group_logs.extend(logs)
+        self.finished_workers += 1
+
+        if self.finished_workers != len(self.active_workers) or self.task_finished_called:
+            return
+
+        self.task_finished_called = True
+        self.active_workers.clear()
+
+        # 恢复其它控件；并确保 Stop 始终可点
+        self._set_enabled(True)
+        self.stop_btn.setEnabled(True)  # <<< 确保停止按钮可用
+
+        action_name = "赠送彩金" if self.mode == "send" else ("扣除彩金" if self.mode == "deduct" else "扣除钻石")
+
+        # 停止场景
+        if self.task_stopped:
+            try:
+                filename = save_log_to_excel(self.group_logs, mode=self.mode)
+                QMessageBox.information(self, "已停止", f"{action_name}已停止，日志已保存：{filename}")
+            except Exception as e:
+                QMessageBox.warning(self, "警告", str(e))
+            self.reset_progress_ui()
+            self.stats_label.setText("已停止执行")
+            self.stop_btn.setEnabled(True)  # <<< 停止后依然保持可点
+            return
+
+        # 正常完成：send/deduct 进入复核；diamond 直接保存
+        if self.mode in ("send", "deduct"):
+            failed_items = self._collect_failed_for_recheck()
+            if failed_items:
+                self.stats_label.setText(f"{action_name}已结束，正在复核失败记录…请稍等……")
+                self.stop_btn.setEnabled(True)  # <<< 进入复核前也保持可点，便于随时停止复核
+                self.recheck_failed_records(retries=3, delay_seconds=5.0)
+                return
+
+        self.progress_bar.setValue(self.completed_count)
+        self.stats_label.setText(f"{action_name}完成")
+        try:
+            filename = save_log_to_excel(self.group_logs, mode=self.mode)
+            QMessageBox.information(self, "完成", f"{action_name}完成，日志已保存：{filename}")
+        except Exception as e:
+            QMessageBox.warning(self, "警告", str(e))
+        finally:
+            self.stop_btn.setEnabled(True)  # <<< 正常完成后依然保持可点（冗余但安全）
+
+        # NEW: 赠送彩金完成后，询问是否进入“小秘书”并抛出 APPID 清单
+        if self.mode == "send":
+            self._maybe_prompt_send_mail()
+
+    def reset_progress_ui(self):
+        self.completed_count = 0
+        self.total_accounts = 0
+        self.total_amount = 0
+        self.progress_bar.setMaximum(1)
+        self.progress_bar.setValue(0)
+        self.stats_label.setText("0 / 0（已完成0个）")
+
+    # ========= 复核相关 =========
+    def _collect_failed_for_recheck(self):
+        """收集需要复核的行；钻石模式直接返回空。"""
+        if self.mode == "diamond":
+            return []
+
+        keywords = ("请求失败", "接口无返回", "超时", "订单超时", "验证被拒绝", "失败")
+
+        common, cookies = read_common_and_cookies()
+        port = (common.get('port') or "").strip()
+        code = (common.get('code') or "").strip()
+
+        items = []
+        for row in range(self.table.rowCount()):
+            status_item = self.table.item(row, 4)
+            status = (status_item.text() if status_item else "").strip()
+            if not status:
+                continue
+            if any(k in status for k in keywords):
+                group = (self.table.item(row, 0).text() or "").strip()
+                appid = (self.table.item(row, 1).text() or "").strip()
+                cjmc = (self.table.item(row, 3).text() or "").strip()
+
+                token = (cookies.get(group, "") or "").strip()
+                if not token:
+                    # 没有该组 token 无法复核
+                    continue
+
+                headers = {"Cookie": f"token={token}"}
+                items.append({
+                    "row_idx": row,
+                    "group": group,
+                    "appid": appid,
+                    "cjmc": cjmc,
+                    "headers": headers,
+                    "code": code,
+                    "port": port,
+                })
+        return items
+
+    def get_today_range_ts(self, to_now: bool = False):
+        """
+        按北京时间(Asia/Shanghai)返回时间范围的 epoch 秒。
+        - to_now=False: [今天00:00, 明天00:00)
+        - to_now=True : [今天00:00, 现在)
+        """
+        sh = ZoneInfo("Asia/Shanghai")
+
+        # 先取 UTC 再转到目标时区，避免本机时区干扰
+        now = datetime.now(timezone.utc).astimezone(sh)
+
+        # 北京时间的今天零点
+        start_dt = datetime(now.year, now.month, now.day, tzinfo=sh)
+        end_dt = now if to_now else (start_dt + timedelta(days=1))
+
+        print("now:", now, "| start:", start_dt, "| end:", end_dt)
+        return int(start_dt.timestamp()), int(end_dt.timestamp())
+
+    def set_table_status_no_progress(self, row_idx: int, status_text: str):
+        """仅写状态列（复核结果回写），不改变进度/计数。"""
+        if 0 <= row_idx < self.table.rowCount():
+            status_col = getattr(self, "_status_col", 4)
+            minw = getattr(self, "_status_min_width", 150)
+
+            item = self.table.item(row_idx, status_col)
+            if item is None:
+                item = QTableWidgetItem()
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row_idx, status_col, item)
+
+            item.setText(status_text)
+            # NEW: 着色
+            if hasattr(self, "_paint_status"):
+                self._paint_status(item, status_text)
+
+            self.table.scrollToItem(item, QAbstractItemView.PositionAtBottom)
+
+            # 同步调整状态列宽度
+            self.table.resizeColumnToContents(status_col)
+            if self.table.columnWidth(status_col) < minw:
+                self.table.setColumnWidth(status_col, minw)
+
+    def recheck_failed_records(self, retries: int = 3, delay_seconds: float = 5.0):
+        if self.mode == "diamond":
+            return  # 钻石不复核
+
+        items = self._collect_failed_for_recheck()
+        if not items:
+            QMessageBox.information(self, "复核", "没有需要复核的失败记录。")
+            return
+
+        begin_ts, end_ts = self.get_today_range_ts()
+
+        self.in_recheck = True
+        self.recheck_worker = RecheckPaymentWorker(
+            items=items,
+            begin_ts=begin_ts,
+            end_ts=end_ts,
+            retries=retries,
+            delay_seconds=delay_seconds
+        )
+        # 复核结果只写状态列，不影响进度统计
+        self.recheck_worker.signals.result.connect(self.set_table_status_no_progress)
+        self.recheck_worker.signals.finished.connect(self._on_recheck_finished)
+        self.threadpool.start(self.recheck_worker)
+
+    def _on_recheck_finished(self, logs: list):
+        # 标记退出复核阶段，并清理引用
+        self.in_recheck = False
+        self.recheck_worker = None
+
+        # 合并复核日志
+        if hasattr(self, "group_logs"):
+            self.group_logs.extend(logs)
+
+        self.progress_bar.setValue(self.completed_count)
+
+        # 若在复核中被用户停止
+        if getattr(self, "task_stopped", False):
+            try:
+                filename = save_log_to_excel(self.group_logs, mode=self.mode)
+                QMessageBox.information(self, "已停止", f"复核已停止，日志已保存：{filename}")
+            except Exception as e:
+                QMessageBox.warning(self, "警告", str(e))
+            self.reset_progress_ui()
+            self.stats_label.setText("已停止执行")
+            self._set_enabled(True)
+            self.stop_btn.setEnabled(True)  # <<< 停止复核后，确保停止按钮可用
+            return
+
+        # 正常完成
+        action_name = "赠送彩金" if self.mode == "send" else "扣除彩金"
+        self.stats_label.setText(f"{action_name}已完成（复核完成）")
+        try:
+            filename = save_log_to_excel(self.group_logs, mode=self.mode)
+            QMessageBox.information(self, "完成", f"复核完成，日志已保存：{filename}")
+        except Exception as e:
+            QMessageBox.warning(self, "警告", str(e))
+        finally:
+            # 复核结束后，恢复其它控件并保证 Stop 可点
+            self._set_enabled(True)
+            self.stop_btn.setEnabled(True)  # <<< 复核完成后，确保停止按钮可用
+
+        # NEW: 复核完成后（赠送彩金），询问是否进入“小秘书”并抛出 APPID 清单
+        if self.mode == "send":
+            self._maybe_prompt_send_mail()
+
+
+############################################
+# 5) 关于我们页
+############################################
+
+class AboutPage(QWidget):
+    def __init__(self, parent=None, product_name="彩金赠送工具",
+                 version="v1.2.1", build_date="2025-10-11"):
+        super().__init__(parent)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(14)
+
+        # 基础字体（正文）
+        base = QFont("Microsoft YaHei UI")
+        base.setPointSize(11)
+        self.setFont(base)
+
+        # 标题
+        title = QLabel(f"关于{product_name}")
+        title_font = QFont(base)
+        title_font.setPointSize(18)
+        title_font.setWeight(QFont.DemiBold)
+        title.setFont(title_font)
+        title.setStyleSheet("color:#0f172a;")
+        root.addWidget(title, 0, Qt.AlignLeft)
+
+        # ——版本行：三个控件同一字体大小（更醒目）——
+        meta_font = QFont(base)
+        meta_font.setPointSize(12)  # 比正文略大；三者统一
+        # meta_font.setWeight(QFont.Medium)        # 如需再醒目，可打开此行略加粗
+
+        ver_row = QHBoxLayout()
+        ver_row.setSpacing(12)
+
+        ver_label = QLabel("版本：")
+        ver_label.setFont(meta_font)
+
+        ver_value = QLabel(version)
+        ver_value.setFont(meta_font)
+        ver_value.setStyleSheet("color:#0f766e;")  # 绿色但与“版本：”同字号
+
+        date_label = QLabel(f"  更新日期：{build_date}")
+        date_label.setFont(meta_font)
+        date_label.setStyleSheet("color:#64748b;")  # slate-500，但同字号
+
+        ver_row.addWidget(ver_label, 0, Qt.AlignLeft)
+        ver_row.addWidget(ver_value, 0, Qt.AlignLeft)
+        ver_row.addWidget(date_label, 0, Qt.AlignLeft)
+        ver_row.addStretch(1)
+        root.addLayout(ver_row)
+
+        spacer = QFrame()
+        spacer.setFixedHeight(6)
+        spacer.setFrameShape(QFrame.NoFrame)
+        root.addWidget(spacer)
+
+        # 声明标题
+        decl_title = QLabel("声明：")
+        decl_font = QFont(base)
+        decl_font.setPointSize(13)
+        decl_font.setWeight(QFont.DemiBold)
+        decl_title.setFont(decl_font)
+        decl_title.setStyleSheet("color:#111827;")
+        root.addWidget(decl_title, 0, Qt.AlignLeft)
+
+        # 声明正文（QTextBrowser 防裁行）
+        html = """
+        <div style="max-width: 960px;">
+          <p style="line-height:1.9; color:#334155;">
+            本软件仅供具备发放和扣除权限且已获授权的账户，在合规前提下用于赠送彩金/扣除彩金/扣除钻石/发布小秘书。
+            使用者应确保数据与账号来源合规、授权充分，并对自身操作及结果承担全部责任。
+          </p>
+          <p style="line-height:1.9; color:#334155;">
+            因授权不足或违规使用导致的任何损失、均由使用者自行承担。
+            本软件按“现状”提供，不作任何明示或默示担保；作者对因使用或无法使用本软件造成的任何直接或间接损失不承担责任。
+            本软件与相关平台/商户/支付机构无隶属或合作关系。
+          </p>
+          <p style="line-height:1.9; color:#334155;"><b>继续使用即表示您已阅读、理解并同意本声明。</b></p>
+        </div>
+        """
+        browser = QTextBrowser()
+        browser.setHtml(html)
+        browser.setFrameShape(QFrame.NoFrame)
+        browser.setOpenExternalLinks(True)
+        browser.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        browser.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        root.addWidget(browser, 1)
+
+
+class MailListPage(QWidget):
+    """
+    小秘书：
+    - 每个小组一个文本框，用户自行粘贴内容
+    - 只接收 GiftPage.emit() 过来的 APPID 清单
+    - 组与组并发；组内按 <=1000 批量发送
+    - 新增：模板包（下拉+四个按钮）
+    """
+
+    def __init__(self, parent=None, params_page: QWidget = None, nav=None, nav_params_index: int = 4):
+        super().__init__(parent)
+        self.params_page = params_page
+        self.nav = nav
+        self.nav_params_index = nav_params_index
+
+        self.threadpool = QThreadPool()
+        self.active_workers = []
+        self.mail_logs = []
+        self.targets_map = {}   # {"组名":[appid,...]}
+        self.content_edits = {} # {"组名": QTextEdit}
+        self.status_labels = {} # {"组名": QLabel}
+        self.cached_contents = {}
+        self.first_loaded = False
+
+        # 顶部统计
+        self.total_label = QLabel("小组：0 / 账号：0")
+        self.progress = QProgressBar()
+        self.progress.setAlignment(Qt.AlignCenter)
+
+        # ==== 模板包工具条 ====
+        tpl_row = QHBoxLayout()
+        tpl_row.setSpacing(8)
+
+        self.tpl_combo = QComboBox()
+        self.tpl_combo.setMinimumWidth(220)
+        self.tpl_combo.addItem("（未选择模板）", userData=None)
+
+        self.chk_only_empty = QCheckBox("仅填空白")
+        self.chk_only_empty.setChecked(True)
+
+        self.btn_tpl_reload = QPushButton("重新加载")
+        self.btn_tpl_apply  = QPushButton("应用模板")
+        self.btn_tpl_save   = QPushButton("保存为模板包")
+        self.btn_clear_text = QPushButton("清空文本框")
+
+        for b in (self.btn_tpl_reload, self.btn_tpl_apply, self.btn_tpl_save, self.btn_clear_text):
+            b.setMinimumHeight(28)
+
+        tpl_row.addWidget(QLabel("模板包："))
+        tpl_row.addWidget(self.tpl_combo)
+        tpl_row.addWidget(self.chk_only_empty)
+        tpl_row.addStretch(1)
+        tpl_row.addWidget(self.btn_tpl_reload)
+        tpl_row.addWidget(self.btn_tpl_apply)
+        tpl_row.addWidget(self.btn_tpl_save)
+        tpl_row.addWidget(self.btn_clear_text)
+
+        # 滚动区容器
+        self.container = QWidget()
+        self.container_layout = QVBoxLayout(self.container)
+        self.container_layout.setContentsMargins(8, 8, 8, 8)
+        self.container_layout.setSpacing(10)
+        self.container_layout.addStretch(1)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(self.container)
+
+        # 按钮区
+        self.send_btn = QPushButton("🤖 开始发布")
+        self.stop_btn = QPushButton("🛑 停止")
+        self.send_btn.setMinimumHeight(36)
+        self.stop_btn.setMinimumHeight(36)
+        self.send_btn.setEnabled(False)
+
+        self.send_btn.clicked.connect(self.start_send)
+        self.stop_btn.clicked.connect(self.stop_send)
+
+        # 模板按钮槽
+        self.btn_tpl_reload.clicked.connect(self._refresh_template_list)
+        self.btn_tpl_apply.clicked.connect(self._apply_selected_template)
+        self.btn_tpl_save.clicked.connect(self._save_as_template)
+        self.btn_clear_text.clicked.connect(self._clear_all_group_texts)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        btn_row.addWidget(self.send_btn)
+        btn_row.addWidget(self.stop_btn)
+
+        # 主布局
+        root = QVBoxLayout(self)
+        root.addWidget(self.total_label)
+        root.addLayout(tpl_row)       # 把模板工具条放在统计栏下方
+        root.addWidget(scroll, 1)
+        root.addLayout(btn_row)
+        root.addWidget(self.progress)
+
+        # 运行时统计
+        self.total_accounts = 0
+        self.sent_accounts = 0
+        self.finished_workers = 0
+
+        # 初始化模板列表
+        self._refresh_template_list()
+
+    # ---------- 模板包：内部工具 ----------
+
+    def _template_dir(self) -> str:
+        import os, sys
+        # 兼容 PyInstaller 打包后的可执行目录
+        base = os.path.dirname(os.path.abspath(sys.argv[0]))
+        path = os.path.join(base, "templates")  # 只用 templates 目录
+        return path
+
+    def _ensure_template_dir(self) -> str:
+        import os
+        path = self._template_dir()
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def _scan_templates(self):
+        import os, json
+        dirpath = self._ensure_template_dir()
+        items = []
+        try:
+            files = [f for f in os.listdir(dirpath) if f.lower().endswith(".json")]
+            files.sort(key=lambda x: x.lower())
+            for f in files:
+                fp = os.path.join(dirpath, f)
+                file_base = os.path.splitext(f)[0]
+                display = file_base
+                json_name = None
+                try:
+                    with open(fp, "r", encoding="utf-8") as r:
+                        data = json.load(r)
+                        if isinstance(data, dict):
+                            json_name = (data.get("name") or "").strip()
+                            if json_name:
+                                # 只有当 name 与 文件名 不同时才显示“（文件名）”
+                                if json_name.lower() != file_base.lower():
+                                    display = f"{json_name}（{file_base}）"
+                                else:
+                                    display = json_name
+                except Exception:
+                    pass
+                items.append((display, fp, json_name))
+        except Exception:
+            pass
+        return items
+
+    def _refresh_template_list(self):
+        """重新加载模板下拉框"""
+        self.tpl_combo.blockSignals(True)
+        try:
+            self.tpl_combo.clear()
+            self.tpl_combo.addItem("（未选择模板）", userData=None)
+            self._tpl_items = self._scan_templates()  # 缓存
+            for display, fp, _jn in self._tpl_items:
+                self.tpl_combo.addItem(display, userData=fp)
+            # 默认不选任何模板
+            self.tpl_combo.setCurrentIndex(0)
+        finally:
+            self.tpl_combo.blockSignals(False)
+
+    def _apply_selected_template(self):
+        """读取选中模板，把 groups 文案填充到对应的小组文本框"""
+        from PyQt5.QtWidgets import QMessageBox
+        import json, os
+
+        fp = self.tpl_combo.currentData()
+        if not fp:
+            QMessageBox.information(self, "提示", "请先在“模板包”下拉中选择一个模板。")
+            return
+        if not os.path.exists(fp):
+            QMessageBox.warning(self, "提示", "模板文件不存在，已为你刷新列表。")
+            self._refresh_template_list()
+            return
+
+        try:
+            with open(fp, "r", encoding="utf-8") as r:
+                data = json.load(r)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"模板解析失败：{e}")
+            return
+
+        groups = {}
+        if isinstance(data, dict):
+            # 兼容你给的结构：{"name": "...", "groups": {...}}
+            groups = data.get("groups") or {}
+        if not isinstance(groups, dict) or not groups:
+            QMessageBox.information(self, "提示", "该模板没有可用的组内容。")
+            return
+
+        only_empty = self.chk_only_empty.isChecked()
+        filled, skipped, missing = 0, 0, 0
+
+        # 以当前页面存在的小组为准
+        for g, edit in self.content_edits.items():
+            if g in groups:
+                txt = str(groups.get(g) or "")
+                if not txt.strip():
+                    skipped += 1
+                    continue
+                if only_empty and edit.toPlainText().strip():
+                    skipped += 1
+                else:
+                    edit.setPlainText(txt)
+                    filled += 1
+            else:
+                missing += 1
+
+        msg = f"填充完成：成功 {filled} 组"
+        if skipped:
+            msg += f"，跳过 {skipped} 组"
+        if missing:
+            msg += f"，模板中缺少 {missing} 个当前页面的小组"
+        QMessageBox.information(self, "应用模板", msg)
+
+    def _save_as_template(self):
+        """把当前页面所有非空文本框保存为一个模板包（JSON），输入框按钮为中文：确定/取消"""
+        from PyQt5.QtWidgets import QInputDialog, QDialog, QDialogButtonBox, QMessageBox
+        import json, os, re
+
+        # 收集非空内容
+        groups_content = {}
+        for g, edit in self.content_edits.items():
+            txt = edit.toPlainText()
+            if txt.strip():
+                groups_content[g] = txt
+
+        if not groups_content:
+            QMessageBox.information(self, "提示", "没有可保存的内容（当前所有文本框均为空）。")
+            return
+
+        # --- 中文按钮的输入弹窗 ---
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("保存为模板包")
+        dlg.setLabelText("请输入模板名：")
+        dlg.setTextValue("")  # 你也可以设置默认值
+        dlg.setComboBoxEditable(False)
+
+        # 优先使用官方 API（部分 PyQt 版本支持）
+        try:
+            dlg.setOkButtonText("确定")
+            dlg.setCancelButtonText("取消")
+        except Exception:
+            # 兼容旧版本：直接改 ButtonBox 文案
+            box = dlg.findChild(QDialogButtonBox)
+            if box:
+                btn_ok = box.button(QDialogButtonBox.Ok)
+                btn_cancel = box.button(QDialogButtonBox.Cancel)
+                if btn_ok:
+                    btn_ok.setText("确定")
+                if btn_cancel:
+                    btn_cancel.setText("取消")
+
+        if dlg.exec_() != QDialog.Accepted:
+            return  # 用户点了“取消”
+        name = (dlg.textValue() or "").strip()
+
+        if not name:
+            QMessageBox.information(self, "提示", "模板名不能为空。")
+            return
+
+        # 生成文件名（清理非法字符）
+        safe_name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip()
+        if not safe_name:
+            QMessageBox.information(self, "提示", "模板名无效。")
+            return
+
+        dirpath = self._ensure_template_dir()
+        filepath = os.path.join(dirpath, f"{safe_name}.json")
+
+        # 如果存在，确认是否覆盖（中文按钮自动跟随系统/Qt 翻译）
+        if os.path.exists(filepath):
+            ret = QMessageBox.question(
+                self, "覆盖确认", f"模板“{safe_name}”已存在，是否覆盖？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+            )
+            if ret != QMessageBox.Yes:
+                return
+
+        data = {"name": name, "groups": groups_content}
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as w:
+                json.dump(data, w, ensure_ascii=False, indent=2)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"保存失败：{e}")
+            return
+
+        # 刷新下拉并自动选中刚保存的模板
+        self._refresh_template_list()
+        for i in range(self.tpl_combo.count()):
+            if self.tpl_combo.itemData(i) == filepath:
+                self.tpl_combo.setCurrentIndex(i)
+                break
+
+        QMessageBox.information(self, "成功", f"已保存模板：{filepath}")
+
+    # ---------- 你原有逻辑（未改动核心流程） ----------
+
+    def _reset_after_finish(self):
+        """发送完成后重置统计与进度条到 0，并清空目标，禁用发送按钮。"""
+        self.total_accounts = 0
+        self.sent_accounts = 0
+        self.finished_workers = 0
+        self.progress.setMaximum(1)
+        self.progress.setValue(0)
+        self.total_label.setText("小组：0 / 账号：0")
+        self.targets_map.clear()
+        self.send_btn.setEnabled(False)
+
+    def _set_enabled(self, enabled: bool):
+        self.send_btn.setEnabled(enabled)
+        self.stop_btn.setEnabled(enabled)
+
+        # 模板工具条在发送过程中也可以用（按需你可改为禁用）
+        self.tpl_combo.setEnabled(enabled)
+        self.chk_only_empty.setEnabled(enabled)
+        self.btn_tpl_reload.setEnabled(enabled)
+        self.btn_tpl_apply.setEnabled(enabled)
+        self.btn_tpl_save.setEnabled(enabled)
+        self.btn_clear_text.setEnabled(enabled)
+
+        for edit in self.content_edits.values():
+            edit.setEnabled(enabled)
+
+        if self.params_page is not None and hasattr(self.params_page, "set_enabled"):
+            self.params_page.set_enabled(enabled)
+
+        if self.nav is not None and self.nav_params_index is not None:
+            item = self.nav.item(self.nav_params_index)
+            if item:
+                flags = item.flags()
+                if enabled:
+                    item.setFlags(flags | Qt.ItemIsEnabled)
+                else:
+                    item.setFlags(flags & ~Qt.ItemIsEnabled)
+
+    def _make_group_box(self, group: str, count: int):
+        box = QGroupBox(f"{group}（{count} 个）")
+        v = QVBoxLayout(box)
+        edit = QTextEdit()
+        edit.setPlaceholderText("在此粘贴该小组要发布的小秘书内容…")
+        edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        edit.setMinimumHeight(140)
+        edit.setTabChangesFocus(True)
+
+        status = QLabel("状态：待发送")
+        v.addWidget(edit)
+        v.addWidget(status)
+
+        self.content_edits[group] = edit
+        self.status_labels[group] = status
+        return box
+
+    # === 对接 GiftPage ===
+    def loadTargets(self, target_map: dict):
+        target_map = target_map or {}
+
+        # 1) 快照当前已粘贴的内容，稍后恢复
+        snap = {g: e.toPlainText() for g, e in self.content_edits.items()}
+        for g, txt in snap.items():
+            if txt:
+                self.cached_contents[g] = txt
+
+        # 2) 读取 Cookie 顺序；取不到就退化为空列表
+        try:
+            _common, cookies = read_common_and_cookies()
+            cookie_order = [k for k in cookies.keys() if k]
+        except Exception:
+            cookie_order = []
+
+        # 3) 计算并排序
+        incoming_groups = [g for g in (target_map.keys() if target_map else []) if g]
+        seen = set()
+        incoming_groups = [g for g in incoming_groups if not (g in seen or seen.add(g))]
+        ordered_groups = [g for g in cookie_order if g in incoming_groups] + \
+                         [g for g in incoming_groups if g not in cookie_order]
+
+        # 4) 清空重建
+        while self.container_layout.count():
+            item = self.container_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self.content_edits.clear()
+        self.status_labels.clear()
+
+        total_accounts = sum(len(target_map.get(g, [])) for g in ordered_groups)
+
+        for g in ordered_groups:
+            count = len(target_map.get(g, []))
+            box = self._make_group_box(g, count)
+            self.container_layout.addWidget(box)
+            if g in self.cached_contents and not self.content_edits[g].toPlainText():
+                self.content_edits[g].setPlainText(self.cached_contents[g])
+
+        self.container_layout.addStretch(1)
+
+        self.targets_map = {
+            g: [str(x).strip() for x in (target_map.get(g) or []) if str(x).strip()]
+            for g in ordered_groups
+        }
+
+        self.total_accounts = total_accounts
+        self.sent_accounts = 0
+        self.finished_workers = 0
+        self.progress.setMaximum(max(1, total_accounts))
+        self.progress.setValue(0)
+        self.total_label.setText(f"小组：{len(ordered_groups)} / 账号：{total_accounts}")
+        self.send_btn.setEnabled(total_accounts > 0)
+
+        if not getattr(self, "first_loaded", False):
+            self.first_loaded = True
+            # 可选提示
+            # QMessageBox.information(self, "小秘书", "已生成各小组文本框，可提前粘贴邮件内容。")
+
+    def start_send(self):
+        from PyQt5.QtWidgets import QInputDialog, QDialog, QDialogButtonBox, QMessageBox
+
+        if not self.targets_map:
+            QMessageBox.information(self, "提示", "没有可发送的账号。")
+            return
+
+        has_content = any((edit.toPlainText().strip() for edit in self.content_edits.values()))
+        if not has_content:
+            QMessageBox.information(self, "提示", "请先在至少一个小组文本框粘贴小秘书内容。")
+            return
+
+        # 选择过期天数
+        dlg = QInputDialog(self)
+        dlg.setWindowTitle("选择过期时间")
+        dlg.setLabelText("过期时间（天）：")
+        items = ["1", "3", "7", "15", "30", "90"]
+        dlg.setComboBoxItems(items)
+        dlg.setComboBoxEditable(False)
+        dlg.setTextValue("7")
+        try:
+            dlg.setOkButtonText("确定")
+            dlg.setCancelButtonText("取消")
+        except Exception:
+            box = dlg.findChild(QDialogButtonBox)
+            if box:
+                btn_ok = box.button(QDialogButtonBox.Ok)
+                btn_cancel = box.button(QDialogButtonBox.Cancel)
+                if btn_ok: btn_ok.setText("确定")
+                if btn_cancel: btn_cancel.setText("取消")
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        chosen = dlg.textValue().strip()
+        expire_days = int(chosen) if chosen in items else 7
+
+        # 公共参数
+        common, cookies = read_common_and_cookies()
+        port = (common.get('port') or '').strip()
+        code = (common.get('code') or '').strip()
+        if not port or not code:
+            QMessageBox.warning(self, "警告", "请先到【参数配置】填写完整参数并保存")
+            return
+
+        self.mail_logs = []
+        self.active_workers = []
+        self.sent_accounts = 0
+        self.finished_workers = 0
+        self.progress.setMaximum(max(1, self.total_accounts))
+        self.progress.setValue(0)
+
+        missing = []
+        for g in self.targets_map:
+            tok = (cookies.get(g, "") or "").strip()
+            if not tok:
+                missing.append(g)
+        if missing:
+            QMessageBox.information(self, "提示", f"以下小组未配置 Cookie，将跳过：{'、'.join(missing)}")
+
+        any_started = False
+        for g, ids in self.targets_map.items():
+            if not ids:
+                continue
+            token = (cookies.get(g, "") or "").strip()
+            if not token:
+                continue
+            content = self.content_edits.get(g).toPlainText() if g in self.content_edits else ""
+            worker = SendMailWorker(g, ids, content, port, code, token, expire_days=expire_days)
+            worker.signals.progress.connect(self._on_worker_progress)
+            worker.signals.result.connect(self._on_worker_result)
+            worker.signals.finished.connect(self._on_worker_finished)
+            self.active_workers.append(worker)
+            self.threadpool.start(worker)
+            any_started = True
+
+        if not any_started:
+            QMessageBox.information(self, "提示", "没有可发送的小组（可能都缺 Cookie 或没有账号）。")
+            return
+
+        self._set_enabled(False)
+
+    def stop_send(self):
+        had_any = False
+        for w in list(self.active_workers or []):
+            if getattr(w, "is_running", False):
+                w.stop()
+                had_any = True
+        if not had_any:
+            QMessageBox.information(self, "提示", "当前没有正在发送的任务。")
+            return
+        for g, lbl in self.status_labels.items():
+            if lbl.text().strip().startswith("状态：待发送"):
+                lbl.setText("状态：已停止")
+        self.total_label.setText("已发送停止指令，等待任务结束…")
+
+    # === 回调 ===
+    def _on_worker_progress(self, group: str, sent: int, total: int):
+        if group in self.status_labels:
+            self.status_labels[group].setText(f"状态：{sent}/{total}")
+
+        total_sent = 0
+        for g, lbl in self.status_labels.items():
+            txt = lbl.text().strip()
+            if "状态：" in txt and "/" in txt:
+                try:
+                    part = txt.split("状态：", 1)[1]
+                    s, t = part.split("/", 1)
+                    s = int("".join(ch for ch in s if ch.isdigit()))
+                    total_sent += s
+                except Exception:
+                    pass
+        self.progress.setValue(min(self.total_accounts, total_sent))
+
+    def _on_worker_result(self, group: str, status_text: str):
+        if group in self.status_labels:
+            lbl = self.status_labels[group]
+            if status_text.startswith("成功"):
+                lbl.setStyleSheet("color:#2ECC71; font-weight:600;")
+            elif status_text.startswith("部分/失败"):
+                lbl.setStyleSheet("color:#E67E22; font-weight:600;")
+            else:
+                lbl.setStyleSheet("color:#E74C3C; font-weight:600;")
+            lbl.setText(f"状态：{status_text}")
+
+    def _on_worker_finished(self, logs: list):
+        self.mail_logs.extend(logs or [])
+        self.finished_workers += 1
+        if self.finished_workers != len(self.active_workers):
+            return
+
+        self.active_workers.clear()
+        self.progress.setValue(self.progress.maximum())
+        self._set_enabled(True)
+
+        try:
+            filename = save_log_to_excel(self.mail_logs, mode="mail")
+            QMessageBox.information(self, "完成", f"小秘书发布完成，日志已保存：{filename}")
+        except Exception:
+            QMessageBox.information(self, "完成", "小秘书发布完成。")
+        finally:
+            self._reset_after_finish()
+            self._clear_all_group_texts()
+            self._reset_status_labels()
+
+    def _clear_all_group_texts(self):
+        """清空所有小组文本框，并清除缓存，避免下次 loadTargets 恢复旧文本。"""
+        for g, edit in self.content_edits.items():
+            try:
+                edit.clear()
+            except Exception:
+                pass
+        self.cached_contents.clear()
+
+    def _reset_status_labels(self):
+        for g, lbl in self.status_labels.items():
+            try:
+                lbl.setStyleSheet("")
+                lbl.setText("状态：待发送")
+            except Exception:
+                pass
+
+
+class MainWindow(QMainWindow):
+    # 统一控制导航项高度
+    class _NavItemDelegate(QStyledItemDelegate):
+        def __init__(self, row_height=64, parent=None):
+            super().__init__(parent)
+            self._h = row_height
+
+        def sizeHint(self, option, index):
+            sz = super().sizeHint(option, index)
+            return QSize(sz.width(), self._h)
+
+    def __init__(self):
+        super().__init__()
+        # 🌐 联网验证 + 时间验证
+        self.check_network_validation()
+
+        self.setWindowTitle("彩金赠送工具")
+        self.resize(1200, 800)
+
+        # 加载 base64 图标（确保字符串完整）
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        # 设置主窗口样式
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: white;            /* 白色背景 */
+                color: #3498db;                     /* 蓝色文字 */
+                border: 1px solid #3498db;          /* 蓝色边框 */
+                border-radius: 8px;                 /* 圆角半径8px */
+                padding: 10px 16px;                 /* 内边距 */
+                font-size: 16px;                    /* 字体大小 */
+                font-weight: bold;                 /* 字体加粗 */
+                letter-spacing: 0.5px;              /* 字符间距 */
+            }
+
+            QLineEdit:focus {
+                border-color: #4a90e2;  /* 输入框聚焦时边框颜色 */
+                /* background-color: #eaf4ff;  输入框聚焦时背景色 */
+            }
+
+            QPushButton:hover {
+                background-color: #ecf5fb;          /* 鼠标悬停时浅蓝背景（视觉反馈） */
+                color: #2980b9;                     /* 悬停时文字颜色稍微加深 */
+                border: 1px solid #2980b9;          /* 边框颜色也稍微加深 */
+            }
+
+            QPushButton:pressed {
+                background-color: #d6eaf8;          /* 按下时更深一点的浅蓝背景 */
+                padding-left: 14px;                 /* 模拟按压感 */
+                padding-top: 12px;
+            }
+
+            QPushButton:disabled {
+                background-color: #f0f0f0;          /* 禁用时背景灰色 */
+                color: #bdc3c7;                     /* 禁用时字体浅灰 */
+                border: 1px solid #ccc;             /* 边框变浅灰 */
+            }
+
+            QLineEdit, QComboBox, QDateTimeEdit {
+                padding: 6px;                      /* 输入控件内边距（6px） */
+                border: 1px solid #ccc;            /* 边框颜色为浅灰色 */
+                border-radius: 5px;                /* 圆角（5px） */
+                font-size: 20px;                   /* 字体大小（20px） */
+            }
+
+            QGroupBox {
+                border: 1px solid #aaa;  /* 组框边框颜色和宽度 */
+                border-radius: 8px;  /* 组框圆角 */
+                margin-top: 6px;  /* 组框顶部外边距 */
+            }
+
+            QGroupBox::title {
+                subcontrol-origin: margin;  /* 组框标题基于边距定位 */
+                subcontrol-position: top center;  /* 组框标题居中 */
+                padding: 0 6px;  /* 组框标题内边距 */
+                font-size: 15px;  /* 组框标题字体大小 */
+                font-weight: bold;  /* 组框标题加粗 */
+            }
+        """)
+
+        # 左侧导航（窄侧栏 + 微白 -> 悬停纯白）
+        self._setup_left_nav_like_sample()
+
+        # 右侧页面（顺序与左侧一致）
+        self.pages = QStackedWidget()
+        self.page_params = ParamsPage()
+
+        self.page_send = GiftPage("send", params_page=self.page_params, nav=self.nav, nav_params_index=4)
+        self.page_deduct = GiftPage("deduct", params_page=self.page_params, nav=self.nav, nav_params_index=4)
+        self.page_diamond = GiftPage("diamond", params_page=self.page_params, nav=self.nav, nav_params_index=4)
+
+        # 用 MailListPage 替换占位页
+        self.page_mail = MailListPage(params_page=self.page_params, nav=self.nav, nav_params_index=4)
+
+        self.page_about = AboutPage()
+
+        # ✅ 连接信号：初始化时连一次即可
+        self.page_send.mailTargetsReady.connect(self.page_mail.loadTargets)
+
+        # 顺序保持与左侧导航一致
+        self.pages.addWidget(self.page_send)  # index 0
+        self.pages.addWidget(self.page_deduct)  # index 1
+        self.pages.addWidget(self.page_diamond)  # index 2
+        self.pages.addWidget(self.page_mail)  # index 3  ← 小秘书
+        self.pages.addWidget(self.page_params)  # index 4
+        self.pages.addWidget(self.page_about)  # index 5
+
+        # 主布局
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.nav)
+        layout.addWidget(self.pages, 1)
+        self.setCentralWidget(central)
+
+        # 切换绑定
+        self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
+
+    def _setup_left_nav_like_sample(self):
+        """宽侧栏（200px）：单行全称，选中为蓝底白字，悬停为纯白深字"""
+        self.nav = QListWidget()
+        self.nav.setFixedWidth(200)  # 宽侧栏
+        self.nav.setItemDelegate(MainWindow._NavItemDelegate(48, self.nav))
+        self.nav.setFrameShape(QFrame.NoFrame)
+        self.nav.setFocusPolicy(Qt.NoFocus)
+        self.nav.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.nav.setSpacing(6)
+        self.nav.setFont(QFont("Microsoft YaHei UI", 13))
+        self.nav.setSelectionMode(QAbstractItemView.SingleSelection)
+
+        # 单行全称（不要短字；需要的话可保留 emoji 图标）
+        order = ["赠送彩金", "扣除彩金", "扣除钻石", "小秘书", "参数配置", "关于"]
+        icons = {
+            "赠送彩金": "🎁",
+            "扣除彩金": "➖",
+            "扣除钻石": "💎",
+            "小秘书": "🤖",
+            "参数配置": "⚙️",
+            "关于": "ℹ️",
+        }
+        for name in order:
+            item = QListWidgetItem(f"{icons.get(name, '')}  {name}")
+            item.setTextAlignment(Qt.AlignVCenter)
+            item.setToolTip(name)
+            self.nav.addItem(item)
+        self.nav.setCurrentRow(0)
+        # 主题样式：默认“微白”，悬停“纯白+深字”，选中“蓝底白字”
+        self.nav.setStyleSheet("""
+            QListWidget {
+                background: #3b4b6b;                       /* 深蓝灰底 */
+                color: rgba(255,255,255,0.95);
+                border: none;
+                padding: 8px 6px;
+                outline: 0;
+            }
+            QListWidget::item {
+                margin: 4px 8px;
+                padding: 10px 12px;
+                border-radius: 10px;
+                background: rgba(255,255,255,0.10);       /* 默认有一点点白 */
+            }
+            QListWidget::item:hover {
+                background: #ffffff;                       /* 悬停纯白 */
+                color: #1f2937;                            /* 深色文字 */
+                border: 1px solid rgba(31,41,55,0.10);
+            }
+            QListWidget::item:selected {
+                background: #3b82f6;                       /* 选中蓝底 */
+                color: #ffffff;                             /* 白字 */
+                border: 1px solid rgba(59,130,246,0.50);
+            }
+            /* 低存在感滚动条 */
+            QScrollBar:vertical { background: transparent; width: 6px; margin: 6px 0 6px 0; }
+            QScrollBar::handle:vertical { background: rgba(255,255,255,0.35); border-radius: 3px; min-height: 24px; }
+            QScrollBar::handle:vertical:hover { background: rgba(255,255,255,0.55); }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            """)
+
+    def check_network_validation(self):
+        try:
+            program_id = "zb_scj121"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+
+############################################
+# 7) 入口
+############################################
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    app.setStyle(InstantToolTipStyle(app.style()))
+    w = MainWindow()
+    w.show()
+    sys.exit(app.exec_())
