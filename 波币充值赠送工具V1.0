@@ -1,0 +1,1705 @@
+import os
+import sys
+import time
+from PyQt5.QtWidgets import QCheckBox
+import traceback
+import configparser
+import subprocess
+from datetime import datetime, date, time as dtime, timedelta
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import requests
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+from PyQt5.QtGui import QPixmap, QIcon
+from PyQt5.QtCore import QByteArray
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QThread, QDate
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QMainWindow, QMessageBox, QFileDialog,
+    QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QFrame,
+    QStackedWidget, QDateEdit, QScrollArea, QSizePolicy
+)
+
+
+CONFIG_FILE = "config.ini"
+BONUS_NAME = "充值优惠"
+
+
+def 获取程序目录():
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
+
+def 获取配置路径():
+    return os.path.join(获取程序目录(), CONFIG_FILE)
+
+
+def 创建默认配置():
+    配置路径 = 获取配置路径()
+    if os.path.exists(配置路径):
+        return
+
+    cfg = configparser.ConfigParser()
+    cfg["SETTINGS"] = {
+        "port": "",
+        "code": ""
+    }
+    # 使用新格式
+    cfg["GROUP"] = {
+        "lvcha": ""
+    }
+    cfg["PAYMENT_IDS"] = {
+        "lvcha": "19054"
+    }
+    # 新增：节日模式配置，默认都是平时（0）
+    cfg["HOLIDAY_MODE"] = {
+        "lvcha": "0"
+    }
+
+    with open(配置路径, "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+def 读取配置():
+    创建默认配置()
+    cfg = configparser.ConfigParser()
+    cfg.read(获取配置路径(), encoding="utf-8")
+    return cfg
+
+
+def 保存配置文件(通用配置, 小组配置列表):
+    cfg = configparser.ConfigParser()
+
+    # 保存通用配置
+    cfg["SETTINGS"] = {
+        "port": 通用配置.get("port", "").strip(),
+        "code": 通用配置.get("code", "").strip()
+    }
+
+    # 创建 [GROUP] 段落保存cookie
+    cfg["GROUP"] = {}
+    # 创建 [PAYMENT_IDS] 段落保存支付ID
+    cfg["PAYMENT_IDS"] = {}
+    # 新增：创建 [HOLIDAY_MODE] 段落保存节日模式状态
+    cfg["HOLIDAY_MODE"] = {}
+
+    for item in 小组配置列表:
+        小组名 = item.get("group_name", "").strip()
+        cookie = item.get("cookie", "").strip()
+        payment_class_id = item.get("payment_class_id", "").strip()
+        holiday_mode = item.get("holiday_mode", False)  # 获取节日模式状态
+
+        if not 小组名:
+            continue
+
+        # 保存cookie到 [GROUP] 段落
+        cfg["GROUP"][小组名] = cookie
+        # 保存支付ID到 [PAYMENT_IDS] 段落
+        cfg["PAYMENT_IDS"][小组名] = payment_class_id
+        # 保存节日模式状态到 [HOLIDAY_MODE] 段落（1表示节日，0表示平时）
+        cfg["HOLIDAY_MODE"][小组名] = "1" if holiday_mode else "0"
+
+    with open(获取配置路径(), "w", encoding="utf-8") as f:
+        cfg.write(f)
+
+
+def 获取所有小组配置(cfg):
+    小组列表 = []
+
+    # 获取支付ID映射（新格式）
+    payment_ids = {}
+    if cfg.has_section("PAYMENT_IDS"):
+        payment_ids = dict(cfg["PAYMENT_IDS"].items())
+
+    # 新增：获取节日模式映射
+    holiday_modes = {}
+    if cfg.has_section("HOLIDAY_MODE"):
+        holiday_modes = dict(cfg["HOLIDAY_MODE"].items())
+
+    # 解析 [GROUP] 段落（新格式）
+    if cfg.has_section("GROUP"):
+        group_section = dict(cfg["GROUP"].items())
+        for 小组名, cookie in group_section.items():
+            # 获取节日模式状态，默认为False（平时）
+            holiday_mode = holiday_modes.get(小组名, "0") == "1"
+
+            小组列表.append({
+                "group_name": 小组名,
+                "cookie": cookie.strip(),
+                "payment_class_id": payment_ids.get(小组名, "").strip(),
+                "holiday_mode": holiday_mode  # 新增：节日模式状态
+            })
+
+    # 兼容旧格式（GROUP_lvcha 这种）
+    for section in cfg.sections():
+        if section.startswith("GROUP_") and section != "GROUP":
+            小组名 = section.replace("GROUP_", "", 1)
+            # 旧格式没有节日模式，默认为False
+            小组列表.append({
+                "group_name": 小组名,
+                "cookie": cfg.get(section, "cookie", fallback="").strip(),
+                "payment_class_id": cfg.get(section, "payment_class_id", fallback="").strip(),
+                "holiday_mode": False  # 旧格式默认平时
+            })
+
+    # 去重（避免新旧格式重复）
+    去重后的列表 = []
+    已存在的组名 = set()
+    for item in 小组列表:
+        if item["group_name"] not in 已存在的组名:
+            已存在的组名.add(item["group_name"])
+            去重后的列表.append(item)
+
+    return 去重后的列表
+
+
+def 打开文件(path):
+    if not os.path.exists(path):
+        return
+
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        pass
+
+
+def 时间转时间戳(dt_obj):
+    return int(time.mktime(dt_obj.timetuple()))
+
+
+def 获取充值明细时间戳(开始日期: date, 结束日期: date):
+    """
+    充值明细接口：
+    开始时间：YYYY-MM-DD 00:00:00
+    结束时间：结束日期 + 1天 的 00:00:00
+    """
+    开始dt = datetime.combine(开始日期, dtime(0, 0, 0))
+    结束dt = datetime.combine(结束日期 + timedelta(days=1), dtime(0, 0, 0))
+    return 时间转时间戳(开始dt), 时间转时间戳(结束dt)
+
+
+def 获取游戏日志时间戳(开始日期: date, 结束日期: date):
+    """
+    游戏日志接口：
+    开始时间：YYYY-MM-DD 00:00:00
+    结束时间：YYYY-MM-DD 23:59:59
+    """
+    开始dt = datetime.combine(开始日期, dtime(0, 0, 0))
+    结束dt = datetime.combine(结束日期, dtime(23, 59, 59))
+    return 时间转时间戳(开始dt), 时间转时间戳(结束dt)
+
+
+def 金额转浮点(value):
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def 保留两位(value):
+    return round(float(value) + 1e-8, 2)
+
+
+def 四舍五入取整(value):
+    return int(round(float(value)))
+
+
+def 创建会话():
+    s = requests.Session()
+    s.verify = False
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0",
+        "Connection": "close"
+    })
+    return s
+
+
+class 波币处理器:
+    def __init__(self, port, code, groups, 开始日期, 结束日期, 模式, 日志回调=None):
+        self.port = str(port).strip()
+        self.code = str(code).strip()
+        self.groups = groups  # groups 现在包含 holiday_mode 字段
+        self.开始日期 = 开始日期
+        self.结束日期 = 结束日期
+        self.模式 = 模式  # 这个可以保留，但实际会优先用小组的节日模式
+        self.日志回调 = 日志回调
+        self.session = 创建会话()
+        self.最新明细文件 = ""
+        self.最新赠送文件 = ""
+        self.致命错误 = False
+        self.致命错误信息 = ""
+
+    def log(self, text):
+        if self.日志回调:
+            self.日志回调(text)
+
+    def 获取headers(self, cookie):
+        return {"Cookie": f"token={cookie}"}
+
+    def post_json(self, url, headers, data):
+        r = self.session.post(url, headers=headers, data=data, timeout=30)
+        r.raise_for_status()
+        return r.json()
+
+    def 带重试的请求(self, func, *args, **kwargs):
+        """统一的带重试的请求方法"""
+        最大重试次数 = 3
+        for 尝试次数 in range(最大重试次数):
+            try:
+                return func(*args, **kwargs)
+            except requests.exceptions.ConnectionError as e:
+                # 端口错误是致命错误
+                self.致命错误 = True
+                self.致命错误信息 = f"端口连接失败: {e}"
+                raise
+            except Exception as e:
+                # 检查是否是502错误
+                if hasattr(e, 'response') and e.response is not None:
+                    if e.response.status_code == 502:
+                        if 尝试次数 < 最大重试次数 - 1:
+                            等待时间 = 2 ** 尝试次数
+                            self.log(f"遇到502错误，{等待时间}秒后重试第{尝试次数 + 2}次...")
+                            time.sleep(等待时间)
+                            continue
+
+                    # 检查JSON响应中的错误码
+                    try:
+                        resp_json = e.response.json()
+                        if resp_json.get("code") == -10000:
+                            msg = resp_json.get("msg", "")
+                            if "login_code" in msg:
+                                # code错误 - 致命
+                                self.致命错误 = True
+                                self.致命错误信息 = f"code校验失败: {msg}"
+                                raise
+                            elif "设备登陆" in msg or "token" in msg:
+                                # cookie错误 - 小组级
+                                raise Exception(f"COOKIE_ERROR:{msg}")
+                    except:
+                        pass
+
+                if 尝试次数 == 最大重试次数 - 1:
+                    raise
+                time.sleep(1)
+
+    def 查询波币充值汇总(self, cookie, payment_class_id):
+        headers = self.获取headers(cookie)
+        url = f"http://v.boinht.com:{self.port}/payment_log/list_payment_log"
+
+        开始戳, 结束戳 = 获取充值明细时间戳(self.开始日期, self.结束日期)
+
+        page = 1
+        page_size = 10000
+        appid_totals = defaultdict(float)
+
+        while True:
+            payload = {
+                'page_size': str(page_size),
+                'page': str(page),
+                'channel_id': '',
+                'open_channel_id': '',
+                'is_pay': '1',
+                'send_item_time': '1',
+                'begin_time': str(开始戳),
+                'end_time': str(结束戳),
+                'is_first_recharge': '0',
+                'payment_class_id': '',
+                'nickname': '',
+                'order_id': '',
+                'out_order_id': '',
+                'money_type': '1',
+                'oper_user': '',
+                'content': '',
+                'content2': '',
+                'content_list': '',
+                'min_money': '',
+                'max_money': '',
+                'login_code': self.code,
+                'token': cookie,
+            }
+
+            try:
+                res = self.带重试的请求(self.post_json, url, headers, payload)
+            except Exception as e:
+                self.log(f"查询充值汇总失败: {e}")
+                if self.致命错误:
+                    raise
+                break
+
+            rows = res.get("result", []) or []
+
+            if not rows:
+                break
+
+            for row in rows:
+                支付方式 = str(row.get("payment_class_id", "")).strip()
+                if 支付方式 != str(payment_class_id).strip():
+                    continue
+
+                appid = str(row.get("user_id", "")).strip()
+                金额 = 金额转浮点(row.get("money", 0))
+
+                if appid:
+                    appid_totals[appid] += 金额
+
+            if len(rows) < page_size:
+                break
+            page += 1
+
+        return dict(appid_totals)
+
+    def 查询游戏ID(self, cookie, appid):
+        headers = self.获取headers(cookie)
+        url = f"http://v.boinht.com:{self.port}/pp_user/pf_app_user_list"
+        payload = {
+            'app_user_id': str(appid),
+            'login_code': self.code,
+            'token': cookie
+        }
+
+        try:
+            res = self.带重试的请求(self.post_json, url, headers, payload)
+            data = res.get("result", []) or []
+            if not data:
+                return ""
+            return str(data[0].get("id", "")).strip()
+        except Exception as e:
+            if "COOKIE_ERROR" in str(e):
+                raise
+            self.log(f"查询游戏ID失败 APPID={appid}: {e}")
+            return ""
+
+    def 查询有效打码(self, cookie, 游戏id):
+        headers = self.获取headers(cookie)
+        url = f"http://v.boinht.com:{self.port}/pp_game_log/pf_list_overview"
+
+        开始戳, 结束戳 = 获取游戏日志时间戳(self.开始日期, self.结束日期)
+
+        payload = {
+            'channel_id': '',
+            'open_channel_id': '',
+            'pid': '',
+            'game_type': '',
+            'user_id': str(游戏id),
+            'transfer_id': '',
+            'begin_time': str(开始戳),
+            'end_time': str(结束戳),
+            'login_code': self.code,
+            'token': cookie,
+        }
+
+        try:
+            res = self.带重试的请求(self.post_json, url, headers, payload)
+            data = res.get("data", {}) or {}
+
+            return {
+                'available_bet_money': 金额转浮点(data.get('available_bet_money', 0)),
+                'bet_money': 金额转浮点(data.get('bet_money', 0)),
+                'win_money': 金额转浮点(data.get('win_money', 0))
+            }
+        except Exception as e:
+            if "COOKIE_ERROR" in str(e):
+                raise
+            self.log(f"查询游戏数据失败：{e}")
+            return {
+                'available_bet_money': 0.0,
+                'bet_money': 0.0,
+                'win_money': 0.0
+            }
+
+    def 查询用户列表数据(self, cookie, 游戏id):
+        headers = self.获取headers(cookie)
+        url = f"http://v.boinht.com:{self.port}/user/pf_list_with_game"
+
+        payload = {
+            'channel_id': '',
+            'open_channel_id': '',
+            'id': '',
+            'game_user_id': str(游戏id),
+            'is_bind': '',
+            'is_black': '',
+            'nickname': '',
+            'is_online': '',
+            'reg_ip': '',
+            'is_recharge': '',
+            'device_type': '',
+            'mobile': '',
+            'apns_code': '',
+            'begin_time': '',
+            'end_time': '',
+            'page_size': '32',
+            'page': '1',
+            'login_code': self.code,
+            'token': cookie,
+        }
+
+        try:
+            res = self.带重试的请求(self.post_json, url, headers, payload)
+            data = res.get("result", []) or []
+            if not data:
+                return {
+                    "total_recharge": 0.0,
+                    "total_cash": 0.0,
+                    "money": 0.0
+                }
+
+            row = data[0]
+            return {
+                "total_recharge": 金额转浮点(row.get("total_recharge", 0)),
+                "total_cash": 金额转浮点(row.get("total_cash", 0)),
+                "money": 金额转浮点(row.get("money", 0))
+            }
+        except Exception as e:
+            if "COOKIE_ERROR" in str(e):
+                raise
+            self.log(f"查询用户列表失败: {e}")
+            return {
+                "total_recharge": 0.0,
+                "total_cash": 0.0,
+                "money": 0.0
+            }
+
+    def 计算赠送比例(self, 打码倍数, 余额=None, 总充值=None, 总提现=None, 游戏损益=None):
+        """
+        平时：
+        1.8 <= 倍数 <= 2.8 -> 1%
+        > 2.8 -> 3%
+        1.0 <= 倍数 < 1.8:
+            余额 < 50 且 (总充值 - 总提现) >= 10000 且 游戏损益 >= 100 -> 1%
+        < 1.0 -> 不送
+
+        节日：
+        1.8 <= 倍数 <= 2.8 -> 2%
+        > 2.8 -> 5%
+        1.0 <= 倍数 < 1.8:
+            余额 < 50 且 (总充值 - 总提现) >= 10000 且 游戏损益 >= 100 -> 1%
+        < 1.0 -> 不送
+        """
+        if 打码倍数 < 1.0:
+            return 0.0
+
+        if 1.8 <= 打码倍数 <= 2.8:
+            return 0.01 if self.模式 == "normal" else 0.02
+
+        if 打码倍数 > 2.8:
+            return 0.03 if self.模式 == "normal" else 0.05
+
+        if 1.0 <= 打码倍数 < 1.8:
+            # 确保数值类型
+            余额 = 金额转浮点(余额)
+            总充值 = 金额转浮点(总充值)
+            总提现 = 金额转浮点(总提现)
+            游戏损益 = 金额转浮点(游戏损益)
+
+            # 1. 检查余额
+            if 余额 >= 50:
+                self.log(f"余额={余额} >= 50，不符合条件")
+                return 0.0
+
+            # 2. 检查充提差额
+            净充值 = 总充值 - 总提现
+            if 净充值 < 10000:
+                self.log(f"净充值={净充值} < 10000，不符合条件")
+                return 0.0
+
+            # 3. 检查游戏损益
+            if 游戏损益 < 100:
+                self.log(f"游戏损益={游戏损益} < 100，不符合条件")
+                return 0.0
+
+            # 4. 满足所有条件
+            self.log(f"满足条件：余额={余额}<50，净充值={净充值}>=10000，游戏损益={游戏损益}>=100")
+            return 0.01
+
+        return 0.0
+
+    def 导出excel(self, 明细按组, 赠送结果):
+        时间标识 = datetime.now().strftime("%m%d_%H%M%S")
+        程序目录 = 获取程序目录()
+
+        明细文件 = os.path.join(程序目录, f"波币充值明细_{时间标识}.xlsx")
+        赠送文件 = os.path.join(程序目录, f"波币充值赠送_{时间标识}.xlsx")
+
+        self.生成明细工作簿(明细文件, 明细按组)
+        self.生成赠送工作簿(赠送文件, 赠送结果)
+
+        self.最新明细文件 = 明细文件
+        self.最新赠送文件 = 赠送文件
+        return 明细文件, 赠送文件
+
+    def 美化sheet(self, ws):
+        标题填充 = PatternFill("solid", fgColor="1F4E78")
+        标题字体 = Font(color="FFFFFF", bold=True)
+        细边框 = Border(
+            left=Side(style="thin", color="D9D9D9"),
+            right=Side(style="thin", color="D9D9D9"),
+            top=Side(style="thin", color="D9D9D9"),
+            bottom=Side(style="thin", color="D9D9D9"),
+        )
+
+        for cell in ws[1]:
+            cell.fill = 标题填充
+            cell.font = 标题字体
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = 细边框
+
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = 细边框
+
+        for col_cells in ws.columns:
+            max_length = 0
+            col_letter = get_column_letter(col_cells[0].column)
+            for cell in col_cells:
+                value = "" if cell.value is None else str(cell.value)
+                max_length = max(max_length, len(value))
+            ws.column_dimensions[col_letter].width = min(max(max_length + 4, 12), 28)
+
+    def 生成明细工作簿(self, file_path, 明细按组):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "汇总表"
+
+        # 第一部分：明细数据表头
+        明细表头 = ["小组", "APPID", "波币总充值", "有效打码"]
+        ws.append(明细表头)
+
+        # 先添加所有明细数据
+        for 小组名, rows in 明细按组.items():
+            for row in rows:
+                # 将 appid 转为数字
+                appid = row.get("appid", "")
+                try:
+                    appid = int(appid)
+                except (ValueError, TypeError):
+                    pass
+
+                ws.append([
+                    小组名,
+                    appid,
+                    保留两位(row.get("波币总充值", 0)),
+                    保留两位(row.get("有效打码", 0)),
+                ])
+
+        # 美化明细部分
+        self.美化sheet(ws)
+
+        # 在F列开始添加小组统计
+        # 计算每个小组的统计信息
+        小组统计 = {}
+        for 小组名, rows in 明细按组.items():
+            充值人数 = len(rows)
+            充值总金额 = sum(保留两位(row.get("波币总充值", 0)) for row in rows)
+            小组统计[小组名] = {
+                "充值人数": 充值人数,
+                "充值总金额": 充值总金额
+            }
+
+        # 定位到F列（第6列）开始写统计表
+        统计起始列 = 6  # F列
+        统计表头 = ["小组", "充值人数", "充值总金额"]
+
+        # 写入统计表头
+        for col_offset, 标题 in enumerate(统计表头):
+            cell = ws.cell(row=1, column=统计起始列 + col_offset)
+            cell.value = 标题
+            cell.fill = PatternFill("solid", fgColor="4F81BD")
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+
+        # 写入统计数据
+        当前行 = 2
+        for 小组名, 统计 in 小组统计.items():
+            ws.cell(row=当前行, column=统计起始列, value=小组名)
+            ws.cell(row=当前行, column=统计起始列 + 1, value=统计["充值人数"])
+            ws.cell(row=当前行, column=统计起始列 + 2, value=保留两位(统计["充值总金额"]))
+            当前行 += 1
+
+        # 添加总计行
+        if 小组统计:
+            总人数 = sum(统计["充值人数"] for 统计 in 小组统计.values())
+            总金额 = sum(统计["充值总金额"] for 统计 in 小组统计.values())
+            当前行 += 1
+            ws.cell(row=当前行, column=统计起始列, value="总计")
+            ws.cell(row=当前行, column=统计起始列 + 1, value=总人数)
+            ws.cell(row=当前行, column=统计起始列 + 2, value=保留两位(总金额))
+            for col in range(统计起始列, 统计起始列 + 3):
+                ws.cell(row=当前行, column=col).font = Font(bold=True)
+
+        # 设置统计列的宽度
+        for col in range(统计起始列, 统计起始列 + 3):
+            col_letter = get_column_letter(col)
+            ws.column_dimensions[col_letter].width = 15
+
+        # 原有的其他sheet不变
+        for 小组名, rows in 明细按组.items():
+            gws = wb.create_sheet(title=小组名[:31] if 小组名 else "未命名")
+            gws.append(明细表头)
+            for row in rows:
+                appid = row.get("appid", "")
+                try:
+                    appid = int(appid)
+                except (ValueError, TypeError):
+                    pass
+
+                gws.append([
+                    小组名,
+                    appid,
+                    保留两位(row.get("波币总充值", 0)),
+                    保留两位(row.get("有效打码", 0)),
+                ])
+            self.美化sheet(gws)
+
+        wb.save(file_path)
+
+    def 生成赠送工作簿(self, file_path, 赠送结果):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "赠送记录"
+
+        表头 = ["小组", "APPID", "赠送金额", "彩金名称"]
+        ws.append(表头)
+
+        for row in 赠送结果:
+            # 将 APPID 转为数字
+            appid = row.get("APPID", "")
+            try:
+                appid = int(appid)
+            except (ValueError, TypeError):
+                pass
+
+            ws.append([
+                row.get("小组", ""),
+                appid,
+                int(row.get("赠送金额", 0)),
+                row.get("彩金名称", BONUS_NAME),
+            ])
+
+        self.美化sheet(ws)
+        wb.save(file_path)
+
+    def 处理单个用户(self, 小组名, cookie, appid, 波币总充值, holiday_mode=False):
+        """处理单个用户的数据，增加 holiday_mode 参数"""
+        try:
+            游戏id = self.查询游戏ID(cookie, appid)
+            if not 游戏id:
+                self.log(f"【{小组名}】APPID={appid} 未查到游戏ID，跳过。")
+                return None, None
+
+            游戏数据 = self.查询有效打码(cookie, 游戏id)
+            有效打码 = 游戏数据['available_bet_money']
+            下注金额 = 游戏数据['bet_money']
+            中奖金额 = 游戏数据['win_money']
+
+            明细数据 = {
+                "appid": appid,
+                "游戏id": 游戏id,
+                "波币总充值": 波币总充值,
+                "有效打码": 有效打码,
+                "下注金额": 下注金额,
+                "中奖金额": 中奖金额
+            }
+
+            if 波币总充值 < 100:
+                self.log(f"【{小组名}】APPID={appid} 波币总充值低于100，不赠送。")
+                return 明细数据, None
+
+            打码倍数 = 0.0
+            if 波币总充值 > 0:
+                打码倍数 = 有效打码 / 波币总充值
+
+            赠送比例 = 0.0
+
+            if 打码倍数 < 1.0:
+                赠送比例 = 0.0
+            elif 1.8 <= 打码倍数 <= 2.8:
+                # 修改：同时判断全局模式和小组复选框
+                if self.模式 == "holiday" and holiday_mode:  # 只有点击了节日按钮且小组勾选，才用节日比例
+                    赠送比例 = 0.02
+                else:
+                    赠送比例 = 0.01
+            elif 打码倍数 > 2.8:
+                # 修改：同时判断全局模式和小组复选框
+                if self.模式 == "holiday" and holiday_mode:  # 只有点击了节日按钮且小组勾选，才用节日比例
+                    赠送比例 = 0.05
+                else:
+                    赠送比例 = 0.03
+            else:
+                用户数据 = self.查询用户列表数据(cookie, 游戏id)
+                总充值 = 用户数据.get("total_recharge", 0)
+                总提现 = 用户数据.get("total_cash", 0)
+                余额 = 用户数据.get("money", 0)
+                游戏损益 = abs(下注金额) - 中奖金额
+                self.log(f"【{小组名}】APPID={appid} 游戏损益计算：|{下注金额}| - {中奖金额} = {游戏损益}")
+
+                赠送比例 = self.计算赠送比例(
+                    打码倍数=打码倍数,
+                    余额=余额,
+                    总充值=总充值,
+                    总提现=总提现,
+                    游戏损益=游戏损益
+                )
+
+            if 赠送比例 > 0:
+                赠送金额 = 四舍五入取整(波币总充值 * 赠送比例)
+                if 赠送金额 > 0:
+                    赠送记录 = {
+                        "小组": 小组名,
+                        "APPID": appid,
+                        "赠送金额": 赠送金额,
+                        "彩金名称": BONUS_NAME
+                    }
+                    self.log(f"【{小组名}】APPID={appid} 赠送金额：{赠送金额}")
+                    return 明细数据, 赠送记录
+
+            return 明细数据, None
+
+        except Exception as e:
+            if "COOKIE_ERROR" in str(e):
+                raise
+            self.log(f"【{小组名}】APPID={appid} 处理失败: {e}")
+            return None, None
+
+    def 处理小组(self, 小组名, cookie, payment_class_id, holiday_mode=False):
+        """处理单个小组的所有用户"""
+        小组明细 = []
+        小组赠送 = []
+
+        try:
+            appid_totals = self.查询波币充值汇总(cookie, payment_class_id)
+        except Exception as e:
+            if self.致命错误:
+                raise  # 致命错误向上传递
+            self.log(f"【{小组名}】查询波币充值汇总失败：{e}")
+            return 小组明细, 小组赠送
+
+        self.log(f"【{小组名}】波币充值用户数：{len(appid_totals)}")
+
+        if not appid_totals:
+            return 小组明细, 小组赠送
+
+        # 使用线程池并发处理用户
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            # 提交所有任务
+            future_to_appid = {}
+            for appid, 波币总充值 in appid_totals.items():
+                # 传递 holiday_mode 参数
+                future = executor.submit(self.处理单个用户, 小组名, cookie, appid, 波币总充值, holiday_mode)
+                future_to_appid[future] = appid
+
+            # 收集结果
+            for future in as_completed(future_to_appid):
+                appid = future_to_appid[future]
+                try:
+                    明细数据, 赠送记录 = future.result()
+                    if 明细数据:
+                        小组明细.append(明细数据)
+                    if 赠送记录:
+                        小组赠送.append(赠送记录)
+                except Exception as e:
+                    if "COOKIE_ERROR" in str(e):
+                        raise  # cookie错误向上传递
+                    self.log(f"【{小组名}】APPID={appid} 处理时发生错误: {e}")
+
+        return 小组明细, 小组赠送
+
+    def 执行(self):
+        明细按组 = defaultdict(list)
+        赠送结果 = []
+        失败小组 = []
+
+        # 先检查致命错误（端口/code）
+        try:
+            # 用一个测试请求检查端口和code
+            test_headers = self.获取headers(self.groups[0]["cookie"] if self.groups else "")
+            test_url = f"http://v.boinht.com:{self.port}/user/pf_list_with_game"
+            test_payload = {
+                'login_code': self.code,
+                'token': self.groups[0]["cookie"] if self.groups else "",
+                'page_size': '1',
+                'page': '1'
+            }
+            self.带重试的请求(self.post_json, test_url, test_headers, test_payload)
+        except Exception as e:
+            self.log(f"连接测试失败: {e}")
+            if self.致命错误:
+                error_msg = self.致命错误信息 or "端口或code配置错误"
+                raise Exception(error_msg)
+
+        # 使用进程池并发处理小组
+        with ProcessPoolExecutor(max_workers=min(20, len(self.groups))) as executor:
+            # 准备进程池任务
+            future_to_group = {}
+            for group in self.groups:
+                小组名 = group.get("group_name", "").strip()
+                cookie = group.get("cookie", "").strip()
+                payment_class_id = group.get("payment_class_id", "").strip()
+
+                if not 小组名 or not cookie or not payment_class_id:
+                    continue
+
+                self.log(f"提交小组任务：{小组名}")
+                # 每个进程需要独立的处理器实例
+                future = executor.submit(
+                    self._处理小组进程,
+                    self.port, self.code, 小组名, cookie, payment_class_id,
+                    self.开始日期, self.结束日期, self.模式,
+                    group.get("holiday_mode", False)  # 新增：传递节日模式状态
+                )
+                future_to_group[future] = 小组名
+
+            # 收集进程结果
+            for future in as_completed(future_to_group):
+                小组名 = future_to_group[future]
+                try:
+                    小组明细, 小组赠送 = future.result(timeout=300)
+                    if 小组明细:
+                        明细按组[小组名].extend(小组明细)
+                    if 小组赠送:
+                        赠送结果.extend(小组赠送)
+                    self.log(f"【{小组名}】处理完成，明细数：{len(小组明细)}，赠送数：{len(小组赠送)}")
+                except Exception as e:
+                    error_str = str(e)
+                    if "COOKIE_ERROR" in error_str:
+                        self.log(f"【{小组名}】Cookie错误，已跳过该小组: {error_str}")
+                        失败小组.append(f"{小组名}(cookie错误)")
+                    elif self.致命错误:
+                        # 致命错误，终止所有
+                        raise
+                    else:
+                        self.log(f"【{小组名}】处理失败: {error_str}")
+                        失败小组.append(小组名)
+
+        if 失败小组:
+            self.log(f"以下小组处理失败: {', '.join(失败小组)}")
+
+        明细文件, 赠送文件 = self.导出excel(明细按组, 赠送结果)
+
+        self.log(f"明细文件已生成：{明细文件}")
+        self.log(f"赠送文件已生成：{赠送文件}")
+
+        return {
+            "明细文件": 明细文件,
+            "赠送文件": 赠送文件,
+            "赠送条数": len(赠送结果),
+            "失败小组": 失败小组
+        }
+
+    @staticmethod
+    def _处理小组进程(port, code, 小组名, cookie, payment_class_id, 开始日期, 结束日期, 模式, holiday_mode=False):
+        """静态方法：在独立进程中处理小组"""
+        processor = 波币处理器(
+            port=port,
+            code=code,
+            groups=[],  # 不需要groups
+            开始日期=开始日期,
+            结束日期=结束日期,
+            模式=模式
+        )
+        # 需要把 holiday_mode 传给处理小组的方法
+        return processor.处理小组(小组名, cookie, payment_class_id, holiday_mode)
+
+
+class Worker(QObject):
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, port, code, groups, 开始日期, 结束日期, 模式):
+        super().__init__()
+        self.port = port
+        self.code = code
+        self.groups = groups
+        self.开始日期 = 开始日期
+        self.结束日期 = 结束日期
+        self.模式 = 模式
+
+    def run(self):
+        try:
+            处理器 = 波币处理器(
+                port=self.port,
+                code=self.code,
+                groups=self.groups,
+                开始日期=self.开始日期,
+                结束日期=self.结束日期,
+                模式=self.模式,
+                日志回调=self.log.emit
+            )
+            result = 处理器.执行()
+
+            # 如果有失败的小组，在日志中提示
+            失败小组 = result.get("失败小组", [])
+            if 失败小组:
+                self.log.emit(f"注意：以下小组处理失败: {', '.join(失败小组)}")
+
+            self.finished.emit(result)
+
+        except Exception as e:
+            error_msg = traceback.format_exc()
+            self.log.emit(f"任务执行失败: {str(e)}")
+            self.error.emit(error_msg)
+
+
+class 小组配置行(QWidget):
+    def __init__(self, group_name="", cookie="", payment_class_id="", holiday_mode=False):
+        super().__init__()
+        self.init_ui(group_name, cookie, payment_class_id, holiday_mode)
+
+    def init_ui(self, group_name, cookie, payment_class_id, holiday_mode):
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.小组输入 = QLineEdit()
+        self.小组输入.setPlaceholderText("小组名，如 lvcha")
+        self.小组输入.setText(group_name)
+        self.小组输入.setFixedWidth(100)
+
+        self.cookie输入 = QLineEdit()
+        self.cookie输入.setPlaceholderText("Cookie")
+        self.cookie输入.setText(cookie)
+        self.cookie输入.setMinimumWidth(200)
+
+        self.支付ID输入 = QLineEdit()
+        self.支付ID输入.setPlaceholderText("波币支付ID")
+        self.支付ID输入.setText(payment_class_id)
+        self.支付ID输入.setFixedWidth(100)
+
+        # 节日模式复选框
+        self.holiday_check = QCheckBox("节日模式")
+        self.holiday_check.setChecked(holiday_mode)
+        self.holiday_check.setToolTip("勾选后该小组按节日比例赠送")
+
+        self.删除按钮 = QPushButton("删除")
+        self.删除按钮.setFixedWidth(70)
+        self.删除按钮.clicked.connect(self.deleteLater)
+
+        layout.addWidget(QLabel("小组"))
+        layout.addWidget(self.小组输入)
+        layout.addWidget(QLabel("Cookie"))
+        layout.addWidget(self.cookie输入)
+        layout.addWidget(QLabel("支付ID"))
+        layout.addWidget(self.支付ID输入)
+        layout.addWidget(self.holiday_check)
+        layout.addWidget(self.删除按钮)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.latest_detail_file = ""
+        self.latest_bonus_file = ""
+        self.thread = None
+        self.worker = None
+        self.小组行列表 = []
+        self.current_selected_button = None
+        self.current_date_button = None
+        self.init_ui()
+        self.load_config_to_ui()
+
+    def init_ui(self):
+        self.check_network_validation()
+        icon_base64 = "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//8iV///Ilf//yJX//8iV///Ilf//yJW//IiV/+HGFX/FQAAAAAAAAAAAAAAACFV/ychV//OIlf/5AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/PSFW/88iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV//2Ilf/ryJX/5AiV/+1Ilf/+iJX//8iV//aAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJEn/ByFW/5IiVv/+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/6UAAAAAAAAAAAAAAAAAAAAAAAAAACBV/xghVv/JIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/TAAAAAAAAAAAAAAAAAAAAAAhWv8fIVf/3SJX//8iV///Ilf//yJX/+giVv+9IVf/oSJX/5YiV/+cIlb/tCJX/98iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/84AAP8BAAAAAAAAAAAAAAAAIVn/FyJX/9wiV///Ilb/ySJV/28jVf8kAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFS/x8hV/91Ilf/4CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8hV//8IFf/OAAAAAAAAAAAAAAAACpV/wYiV//FIlf/rSJY/zQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYgVv+OIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/4gAAAAAAAAAAAAAAAAAAAAAIVf/VSBT/zcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAhWf8XIlf/xSJX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AAAAAAAAIlb/dyJX//8hVv/PG1H/EwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIGD/CABV/wMAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABxV/wkhV//lIVf/wh5a/xEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIVj/eiJX/5wkSf8HAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFZ/xciVv9TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAKAAAADAAAABgAAAAAQAgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD/AUBA/wQqVf8GJEn/BzNm/wUAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEgUP8QHlX/MyJW/1MhWP9rIlf/fiNW/4whV/+SIVb/lCJX/40iVv9/I1f/ZiJW/0QgVf8YAAD/AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFT/y4hWf8XAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAaTf8KIlf/TCFY/6AjV//VIVf/5SJX//AiV//4Ilf//iJX//8iV///Ilf//yJX//8iVv/+Ilf/9yJX/+siV//YIlf/liNX/ywAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJFv/KiJX/9AjV/9JAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAcVf8JHVf/IyFW/3whV//fIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW//ghVv+gIVf/Lxdd/wsAAAAAAAAAAAAAAAAAAAAAAAAAACpV/wYkWP9AIVj/3SJX//UhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACNU/zoiVv+UIlf/5CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/6iJX/54gWP9XIlP/JSBg/xAcVf8bI1X/QiFX/4oiV//iIlf//yJX//YhVv9lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAbXv8TIlf/kCJX/+giV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//4iV//xIlf/4SJX/9ohV//dIlf/6iJX//wiV///Ilf//yJX//EhV/9VAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAQED/BCBY/zciV//IIlf//iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yNX/+UkV/8yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgUP8QIVb/cyJX/+ciV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJW/8MaTf8KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdi/w0iV/+VIlf/9iJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/2EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiNW/6EiV///Ilf//yJX//8iV///Ilf//yJX//oiV//vIlf/5yJX/+EhV//dIlf/3CNX/90iV//hIlf/6CJX//EiV//8Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf/0kBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAjWP8dIVf/qCJX//8iV///Ilf//yJX//YhV//HIVf/mSJY/3EfWP9RIFj/NyJT/yUdWP8aIVn/FydY/xoiV/8mI1j/OiNY/1chVv98Ilf/qiJX/+EiV//+Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iVv/vIlf/TAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACdO/w0hWP+aIlf/+yJX//8iV//nIVb/iyRX/zIgVf8YHFX/CQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgP8CJFv/DiJa/yUhVv9zIlf/6CJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0iV/+YGmb/CgAAAAAAAAAAAAAAAAAAAAAAAAAAAFX/AyFW/3MiV//zIlf/2SBW/3YaWf8UAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/wEcVf8SIlf/gSJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/9giU/8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFf/WCJW/8MgV/9vHVj/GgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJb/y0iV/+tIlf/+SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/74AQP8EAAAAAAAAAAAAAAAAAAAAAAAAAAAgWP8gIlb/WR1Y/xoAVf8DAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIFT/QCFX/94iV//9Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX/+AiWv8lAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQiVv9TIlj/6yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yFX/+0iVv9KAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACJX/2EiV//iIlf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//YhWP9jAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP8BI1f/bCJX//EiV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//shVv90AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEBA/wQhWP9jIlf/8SJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//8iV///Ilf//yJX//0hV/97AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA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AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACFX/1UiVv/PIFn/PwBA/wQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHFX/EiJX/58hVf8nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIlP/JSJV/w8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="  # 替换成你的 base64
+        icon_data = QByteArray.fromBase64(icon_base64.encode())
+
+        # 更可靠的图标加载方式
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(icon_data, "ICO"):  # 显式指定格式
+            print("❌ 图标加载失败！请检查 base64 数据或文件格式")
+        else:
+            self.setWindowIcon(QIcon(pixmap))  # 设置窗口和任务栏图标
+
+        self.setWindowTitle("波币充值赠送工具V1.0")
+        self.resize(1280, 820)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(10, 10, 10, 10)
+        main_layout.setSpacing(10)
+
+        nav_frame = QFrame()
+        nav_frame.setFixedWidth(180)
+        nav_frame.setStyleSheet("""
+            QFrame {
+                background: #1f2d3d;
+                border-radius: 8px;
+            }
+            QPushButton {
+                color: white;
+                background: #34495e;
+                border: none;
+                padding: 14px;
+                text-align: left;
+                border-radius: 6px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background: #3f5873;
+            }
+        """)
+        nav_layout = QVBoxLayout(nav_frame)
+        nav_layout.setContentsMargins(12, 12, 12, 12)
+        nav_layout.setSpacing(10)
+
+        self.btn_operation = QPushButton("操作中心")
+        self.btn_config = QPushButton("配置")
+
+        self.btn_operation.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.btn_config.clicked.connect(lambda: self.stack.setCurrentIndex(1))
+
+        nav_layout.addWidget(self.btn_operation)
+        nav_layout.addWidget(self.btn_config)
+        nav_layout.addStretch()
+
+        self.stack = QStackedWidget()
+
+        self.page_operation = self.build_operation_page()
+        self.page_config = self.build_config_page()
+
+        self.stack.addWidget(self.page_operation)
+        self.stack.addWidget(self.page_config)
+
+        main_layout.addWidget(nav_frame)
+        main_layout.addWidget(self.stack, 1)
+
+    def check_network_validation(self):
+        try:
+            program_id = "ZB_波币充值赠送工具V1.0"  # 每个程序用自己的名字（必须和JSON文件里的 key 对应）
+            response = requests.get("http://8.210.92.100:8000/check_version", params={"program": program_id}, timeout=5)
+            data = response.json()
+
+            status = data.get("status")
+
+            if status != "active":
+                QMessageBox.critical(self, "兼容性错误", "系统组件加载失败（Code: S-1）")
+                sys.exit(0)
+
+        except Exception:
+            QMessageBox.critical(self, "兼容性错误", "组件连接失败，请稍后重试（Code: S-2）")
+            sys.exit(0)
+
+    def get_button_style(self, selected=False, is_date_button=False):
+        """统一获取按钮样式"""
+        if selected:
+            # 选中样式（蓝底白字）
+            return """
+                QPushButton {
+                    background: #409eff;
+                    color: white;
+                    border: 1px solid #409eff;
+                    border-radius: 6px;
+                    padding: %s;
+                }
+                QPushButton:hover {
+                    background: #66b1ff;
+                }
+            """ % ("8px 16px" if is_date_button else "10px 16px")
+        else:
+            # 默认样式（白底蓝字）
+            return """
+                QPushButton {
+                    background: white;
+                    color: #409eff;
+                    border: 1px solid #409eff;
+                    border-radius: 6px;
+                    padding: %s;
+                }
+                QPushButton:hover {
+                    background: #ecf5ff;
+                }
+            """ % ("8px 16px" if is_date_button else "10px 16px")
+
+    def build_operation_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(15)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        # 日期范围框
+        box1 = QFrame()
+        box1.setStyleSheet("""
+            QFrame {
+                background: white;
+                border: 1px solid #dcdfe6;
+                border-radius: 8px;
+            }
+        """)
+        box1_layout = QVBoxLayout(box1)
+        box1_layout.setContentsMargins(15, 15, 15, 15)
+        box1_layout.setSpacing(12)
+
+        title1 = QLabel("日期范围")
+        title1.setStyleSheet("font-size:20px;font-weight:bold; color:#303133;")
+
+        # 开始时间和结束时间放在一行，平均分配宽度
+        datetime_layout = QHBoxLayout()
+        datetime_layout.setSpacing(20)
+
+        # 开始时间
+        start_layout = QVBoxLayout()
+        start_layout.setSpacing(5)
+        start_label = QLabel("开始时间")
+        start_label.setStyleSheet("font-size:13px; color:#606266;")
+        self.begin_date = QDateEdit()
+        self.begin_date.setCalendarPopup(True)
+        self.begin_date.setDisplayFormat("yyyy-MM-dd")
+        self.begin_date.setDate(QDate.currentDate())
+        self.begin_date.setMinimumHeight(35)
+        self.begin_date.setStyleSheet("""
+            QDateEdit {
+                border: 1px solid #dcdfe6;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 13px;
+                min-width: 180px;
+            }
+            QDateEdit:focus {
+                border-color: #409eff;
+            }
+            QDateEdit::drop-down {
+                border: none;
+            }
+            QDateEdit::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #909399;
+                width: 0;
+                height: 0;
+            }
+        """)
+        start_layout.addWidget(start_label)
+        start_layout.addWidget(self.begin_date)
+
+        # 结束时间
+        end_layout = QVBoxLayout()
+        end_layout.setSpacing(5)
+        end_label = QLabel("结束时间")
+        end_label.setStyleSheet("font-size:13px; color:#606266;")
+        self.end_date = QDateEdit()
+        self.end_date.setCalendarPopup(True)
+        self.end_date.setDisplayFormat("yyyy-MM-dd")
+        self.end_date.setDate(QDate.currentDate())
+        self.end_date.setMinimumHeight(35)
+        self.end_date.setStyleSheet("""
+            QDateEdit {
+                border: 1px solid #dcdfe6;
+                border-radius: 4px;
+                padding: 8px;
+                font-size: 13px;
+                min-width: 180px;
+            }
+            QDateEdit:focus {
+                border-color: #409eff;
+            }
+            QDateEdit::drop-down {
+                border: none;
+            }
+            QDateEdit::down-arrow {
+                image: none;
+                border-left: 5px solid transparent;
+                border-right: 5px solid transparent;
+                border-top: 5px solid #909399;
+                width: 0;
+                height: 0;
+            }
+        """)
+        end_layout.addWidget(end_label)
+        end_layout.addWidget(self.end_date)
+
+        datetime_layout.addLayout(start_layout)
+        datetime_layout.addLayout(end_layout)
+        datetime_layout.addStretch()
+
+        # 日期快捷按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.setSpacing(10)
+
+        self.btn_prev_day = QPushButton("← 上一日")
+        self.btn_today = QPushButton("今日")
+        self.btn_next_day = QPushButton("下一日 →")
+
+        for btn in [self.btn_prev_day, self.btn_today, self.btn_next_day]:
+            btn.setFixedHeight(35)
+            btn.setMinimumWidth(90)
+            btn.setCursor(Qt.PointingHandCursor)
+
+        # 设置日期按钮默认样式
+        self.btn_prev_day.setStyleSheet(self.get_button_style(False, True))
+        self.btn_today.setStyleSheet(self.get_button_style(False, True))
+        self.btn_next_day.setStyleSheet(self.get_button_style(False, True))
+
+        # 日期按钮点击事件
+        self.btn_prev_day.clicked.connect(lambda: self.on_date_click(self.btn_prev_day, "prev"))
+        self.btn_today.clicked.connect(lambda: self.on_date_click(self.btn_today, "today"))
+        self.btn_next_day.clicked.connect(lambda: self.on_date_click(self.btn_next_day, "next"))
+
+        btn_layout.addWidget(self.btn_prev_day)
+        btn_layout.addWidget(self.btn_today)
+        btn_layout.addWidget(self.btn_next_day)
+        btn_layout.addStretch()
+
+        box1_layout.addWidget(title1)
+        box1_layout.addLayout(datetime_layout)
+        box1_layout.addLayout(btn_layout)
+
+        # 操作按钮框
+        box2 = QFrame()
+        box2.setStyleSheet("""
+            QFrame {
+                background: white;
+                border: 1px solid #dcdfe6;
+                border-radius: 8px;
+            }
+        """)
+        box2_layout = QVBoxLayout(box2)
+        box2_layout.setContentsMargins(15, 15, 15, 15)
+        box2_layout.setSpacing(12)
+
+        title2 = QLabel("执行操作")
+        title2.setStyleSheet("font-size:20px;font-weight:bold; color:#303133;")
+
+        # 操作按钮
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(15)
+
+        self.btn_normal = QPushButton("平时模式")
+        self.btn_holiday = QPushButton("节日模式")
+        self.btn_export = QPushButton("📤 导出数据")
+
+        for btn in [self.btn_normal, self.btn_holiday, self.btn_export]:
+            btn.setFixedHeight(42)
+            btn.setMinimumWidth(120)
+            btn.setCursor(Qt.PointingHandCursor)
+
+        # 设置操作按钮默认样式
+        self.btn_normal.setStyleSheet(self.get_button_style(False, False))
+        self.btn_holiday.setStyleSheet(self.get_button_style(False, False))
+        self.btn_export.setStyleSheet(self.get_button_style(False, False))
+
+        # 操作按钮点击事件
+        self.btn_normal.clicked.connect(lambda: self.on_action_click(self.btn_normal, "normal"))
+        self.btn_holiday.clicked.connect(lambda: self.on_action_click(self.btn_holiday, "holiday"))
+        self.btn_export.clicked.connect(self.on_export_click)
+
+        action_layout.addWidget(self.btn_normal)
+        action_layout.addWidget(self.btn_holiday)
+        action_layout.addWidget(self.btn_export)
+        action_layout.addStretch()
+
+        box2_layout.addWidget(title2)
+        box2_layout.addLayout(action_layout)
+
+        # 日志框
+        log_box = QFrame()
+        log_box.setStyleSheet("""
+            QFrame {
+                background: white;
+                border: 1px solid #dcdfe6;
+                border-radius: 8px;
+            }
+        """)
+        log_layout = QVBoxLayout(log_box)
+        log_layout.setContentsMargins(15, 15, 15, 15)
+        log_layout.setSpacing(10)
+
+        log_title = QLabel("运行日志")
+        log_title.setStyleSheet("font-size:20px;font-weight:bold; color:#303133;")
+
+        self.log_edit = QLineEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setPlaceholderText("这里显示最新日志...")
+        self.log_edit.setMinimumHeight(45)
+        self.log_edit.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #dcdfe6;
+                border-radius: 4px;
+                padding: 8px 12px;
+                background: #f5f7fa;
+                font-size: 13px;
+                color: #606266;
+            }
+        """)
+
+        log_layout.addWidget(log_title)
+        log_layout.addWidget(self.log_edit)
+
+        # 添加到主布局
+        layout.addWidget(box1)  # 日期范围框
+        layout.addWidget(box2)  # 操作按钮框
+        layout.addWidget(log_box, 0)  # 日志框不拉伸，自适应高度
+        layout.addStretch(1)  # 添加弹性空间，占满剩余空间
+
+        return page
+
+    def build_config_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        layout.setContentsMargins(10, 10, 10, 10)  # 设置边距
+
+        # 小组配置框 - 让它占据更多空间
+        box1 = QFrame()
+        box1.setStyleSheet(self.box_style())
+        box1_layout = QVBoxLayout(box1)
+        box1_layout.setContentsMargins(12, 12, 12, 12)
+
+        title1 = QLabel("小组配置（勾选节日模式的小组按节日2~5%比例赠送, 不勾选按照平时1~3%比例赠送）")
+        title1.setStyleSheet("font-size:20px;font-weight:bold;")
+
+        self.group_scroll = QScrollArea()
+        self.group_scroll.setWidgetResizable(True)
+        self.group_scroll.setMinimumHeight(350)
+        # 让滚动区域可以自动扩展
+        self.group_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        self.group_container = QWidget()
+        self.group_container_layout = QVBoxLayout(self.group_container)
+        self.group_container_layout.setSpacing(8)
+        self.group_container_layout.addStretch()
+
+        self.group_scroll.setWidget(self.group_container)
+
+        box1_layout.addWidget(title1)
+        box1_layout.addWidget(self.group_scroll, 1)  # 1 表示让它占据多余空间
+
+        # 通用配置框 - 添加弹性空间让它下移
+        box2 = QFrame()
+        box2.setStyleSheet(self.box_style())
+        box2_layout = QVBoxLayout(box2)
+        box2_layout.setContentsMargins(12, 12, 12, 12)
+
+        title2 = QLabel("通用配置")
+        title2.setStyleSheet("font-size:16px;font-weight:bold;")
+
+        # 通用配置内容
+        row = QHBoxLayout()
+        self.port_input = QLineEdit()
+        self.port_input.setPlaceholderText("端口号")
+
+        self.code_input = QLineEdit()
+        self.code_input.setPlaceholderText("小明计算器登录码")
+
+        row.addWidget(QLabel("端口号："))
+        row.addWidget(self.port_input)
+        row.addSpacing(20)
+        row.addWidget(QLabel("登录码："))
+        row.addWidget(self.code_input)
+
+        box2_layout.addWidget(title2)
+        box2_layout.addLayout(row)
+
+        self.btn_save_config = QPushButton("保存配置")
+        self.btn_save_config.setFixedHeight(42)
+        self.btn_save_config.setStyleSheet(self.get_button_style(False, False))
+        self.btn_save_config.clicked.connect(self.save_config_from_ui)
+
+        # 修改这里的布局
+        layout.addWidget(box1, 5)  # 小组配置框占 5 份（增大占比）
+        layout.addStretch(0)  # 去掉中间的弹性空间，或者设为很小的值
+        layout.addWidget(box2, 1)  # 通用配置框占 1 份
+        layout.addWidget(self.btn_save_config, 0)
+        layout.addStretch(0)
+
+        return page
+
+    def box_style(self):
+        return """
+            QFrame {
+                background: white;
+                border: 1px solid #dcdfe6;
+                border-radius: 8px;
+            }
+            QLabel {
+                font-size: 13px;
+            }
+            QLineEdit, QDateEdit {
+                border: 1px solid #c0c4cc;
+                border-radius: 4px;
+                padding: 8px;
+                min-height: 20px;
+            }
+            QPushButton {
+                background: #409eff;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 16px;
+                min-width: 80px;
+            }
+            QPushButton:hover {
+                background: #66b1ff;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+        """
+
+    def on_date_click(self, button, date_type):
+        """处理日期按钮点击"""
+        # 重置所有日期按钮为默认样式
+        self.btn_prev_day.setStyleSheet(self.get_button_style(False, True))
+        self.btn_today.setStyleSheet(self.get_button_style(False, True))
+        self.btn_next_day.setStyleSheet(self.get_button_style(False, True))
+
+        # 设置当前按钮为选中样式
+        button.setStyleSheet(self.get_button_style(True, True))
+
+        # 执行对应的日期切换功能
+        if date_type == "prev":
+            self.set_prev_day()
+        elif date_type == "today":
+            self.set_today()
+        elif date_type == "next":
+            self.set_next_day()
+
+    def on_action_click(self, button, mode):
+        """处理操作按钮点击"""
+        # 重置所有操作按钮为默认样式
+        self.btn_normal.setStyleSheet(self.get_button_style(False, False))
+        self.btn_holiday.setStyleSheet(self.get_button_style(False, False))
+        self.btn_export.setStyleSheet(self.get_button_style(False, False))
+
+        # 设置当前按钮为选中样式
+        button.setStyleSheet(self.get_button_style(True, False))
+
+        # 执行任务
+        self.start_task(mode)
+
+    def on_export_click(self):
+        """处理导出按钮点击"""
+        # 重置所有操作按钮为默认样式
+        self.btn_normal.setStyleSheet(self.get_button_style(False, False))
+        self.btn_holiday.setStyleSheet(self.get_button_style(False, False))
+        self.btn_export.setStyleSheet(self.get_button_style(False, False))
+
+        # 设置导出按钮为选中样式
+        self.btn_export.setStyleSheet(self.get_button_style(True, False))
+
+        # 执行导出功能
+        self.export_files()
+
+    def clear_group_rows(self):
+        for row in self.小组行列表:
+            row.setParent(None)
+            row.deleteLater()
+        self.小组行列表.clear()
+
+    def add_group_row(self, group_name="", cookie="", payment_class_id="", holiday_mode=False):
+        """添加小组配置行，支持节日模式参数"""
+        row = 小组配置行(group_name, cookie, payment_class_id, holiday_mode)
+        row.删除按钮.clicked.connect(lambda: self.remove_group_row(row))
+        self.group_container_layout.insertWidget(self.group_container_layout.count() - 1, row)
+        self.小组行列表.append(row)
+
+    def remove_group_row(self, row):
+        if row in self.小组行列表:
+            self.小组行列表.remove(row)
+        row.setParent(None)
+        row.deleteLater()
+
+    def load_config_to_ui(self):
+        cfg = 读取配置()
+
+        self.port_input.setText(cfg.get("SETTINGS", "port", fallback="").strip())
+        self.code_input.setText(cfg.get("SETTINGS", "code", fallback="").strip())
+
+        self.clear_group_rows()
+
+        groups = 获取所有小组配置(cfg)
+        if not groups:
+            self.add_group_row("lvcha", "", "19054", False)
+        else:
+            for item in groups:
+                self.add_group_row(
+                    item.get("group_name", ""),
+                    item.get("cookie", ""),
+                    item.get("payment_class_id", ""),
+                    item.get("holiday_mode", False)  # 传入节日模式状态
+                )
+
+    def collect_group_rows(self):
+        """收集所有小组的配置，包括节日模式状态"""
+        groups = []
+        for row in self.小组行列表:
+            group_name = row.小组输入.text().strip()
+            cookie = row.cookie输入.text().strip()
+            payment_class_id = row.支付ID输入.text().strip()
+            holiday_mode = row.holiday_check.isChecked()  # 获取复选框状态
+
+            if not group_name and not cookie and not payment_class_id:
+                continue
+
+            groups.append({
+                "group_name": group_name,
+                "cookie": cookie,
+                "payment_class_id": payment_class_id,
+                "holiday_mode": holiday_mode  # 添加节日模式状态
+            })
+        return groups
+
+    def save_config_from_ui(self):
+        port = self.port_input.text().strip()
+        code = self.code_input.text().strip()
+        groups = self.collect_group_rows()
+
+        if not port:
+            QMessageBox.warning(self, "提示", "端口不能为空")
+            return
+        if not code:
+            QMessageBox.warning(self, "提示", "code 不能为空")
+            return
+        if not groups:
+            QMessageBox.warning(self, "提示", "请至少配置一个小组")
+            return
+
+        group_names = []
+        for g in groups:
+            if not g["group_name"]:
+                QMessageBox.warning(self, "提示", "存在小组名为空，请检查")
+                return
+            if not g["cookie"]:
+                QMessageBox.warning(self, "提示", f"小组 {g['group_name']} 的 cookie 不能为空")
+                return
+            if not g["payment_class_id"]:
+                QMessageBox.warning(self, "提示", f"小组 {g['group_name']} 的波币支付ID 不能为空")
+                return
+            group_names.append(g["group_name"])
+
+        if len(group_names) != len(set(group_names)):
+            QMessageBox.warning(self, "提示", "小组名不能重复")
+            return
+
+        保存配置文件(
+            通用配置={"port": port, "code": code},
+            小组配置列表=groups
+        )
+        QMessageBox.information(self, "提示", "配置保存成功")
+
+    def set_prev_day(self):
+        current_date = self.begin_date.date()
+        prev_date = current_date.addDays(-1)
+        self.begin_date.setDate(prev_date)
+        self.end_date.setDate(prev_date)
+
+    def set_today(self):
+        d = QDate.currentDate()
+        self.begin_date.setDate(d)
+        self.end_date.setDate(d)
+
+    def set_next_day(self):
+        current_date = self.begin_date.date()
+        next_date = current_date.addDays(1)
+        self.begin_date.setDate(next_date)
+        self.end_date.setDate(next_date)
+
+    def append_log(self, text):
+        self.log_edit.setText(text)
+
+    def set_buttons_enabled(self, enabled: bool):
+        self.btn_normal.setEnabled(enabled)
+        self.btn_holiday.setEnabled(enabled)
+        self.btn_export.setEnabled(enabled)
+        self.btn_save_config.setEnabled(enabled)
+
+    def start_task(self, mode):
+        cfg = 读取配置()
+        port = cfg.get("SETTINGS", "port", fallback="").strip()
+        code = cfg.get("SETTINGS", "code", fallback="").strip()
+        groups = 获取所有小组配置(cfg)
+
+        if not port:
+            QMessageBox.warning(self, "提示", "请先在配置页填写端口")
+            return
+        if not code:
+            QMessageBox.warning(self, "提示", "请先在配置页填写 code")
+            return
+        if not groups:
+            QMessageBox.warning(self, "提示", "请先在配置页配置小组")
+            return
+
+        begin_py = self.begin_date.date().toPyDate()
+        end_py = self.end_date.date().toPyDate()
+
+        if begin_py > end_py:
+            QMessageBox.warning(self, "提示", "开始日期不能大于结束日期")
+            return
+
+        self.set_buttons_enabled(False)
+        self.append_log("任务开始执行...")
+
+        self.thread = QThread()
+        self.worker = Worker(
+            port=port,
+            code=code,
+            groups=groups,
+            开始日期=begin_py,
+            结束日期=end_py,
+            模式=mode
+        )
+        self.worker.moveToThread(self.thread)
+
+        self.thread.started.connect(self.worker.run)
+        self.worker.log.connect(self.append_log)
+        self.worker.finished.connect(self.on_task_finished)
+        self.worker.error.connect(self.on_task_error)
+
+        self.worker.finished.connect(self.thread.quit)
+        self.worker.error.connect(self.thread.quit)
+        self.thread.finished.connect(self.thread.deleteLater)
+
+        self.thread.start()
+
+    def on_task_finished(self, result):
+        self.set_buttons_enabled(True)
+        self.latest_detail_file = result.get("明细文件", "")
+        self.latest_bonus_file = result.get("赠送文件", "")
+        count = result.get("赠送条数", 0)
+        失败小组 = result.get("失败小组", [])
+
+        self.append_log("任务完成")
+
+        提示信息 = f"任务完成\n\n已生成文件：\n{os.path.basename(self.latest_detail_file)}\n{os.path.basename(self.latest_bonus_file)}\n\n赠送记录条数：{count}"
+
+        if 失败小组:
+            提示信息 += f"\n\n以下小组处理失败:\n{', '.join(失败小组)}"
+
+        QMessageBox.information(self, "提示", 提示信息)
+
+    def on_task_error(self, err_text):
+        self.set_buttons_enabled(True)
+        self.append_log("任务执行失败")
+        QMessageBox.critical(self, "错误", err_text)
+
+    def export_files(self):
+        if not self.latest_detail_file or not os.path.exists(self.latest_detail_file):
+            QMessageBox.warning(self, "提示", "还没有生成明细文件，请先点击平时或节日按钮")
+            return
+        if not self.latest_bonus_file or not os.path.exists(self.latest_bonus_file):
+            QMessageBox.warning(self, "提示", "还没有生成赠送文件，请先点击平时或节日按钮")
+            return
+
+        QMessageBox.information(self, "提示", "已尝试打开刚生成的两份 Excel 文件")
+        打开文件(self.latest_detail_file)
+        打开文件(self.latest_bonus_file)
+
+
+if __name__ == "__main__":
+    创建默认配置()
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
