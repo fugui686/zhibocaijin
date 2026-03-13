@@ -459,7 +459,7 @@ class UserWindow(QWidget):  # 主窗口类
         layout = QVBoxLayout()
 
         # 文件与线程设置
-        file_group = QGroupBox("您好，欢迎使用游戏人数统计工具！")
+        file_group = QGroupBox("您好，欢迎使用限时福利彩金小助手！")
         file_layout = QVBoxLayout()
 
         # ===== 彩金配置区域 =====
@@ -863,7 +863,7 @@ class UserWindow(QWidget):  # 主窗口类
         col.setSpacing(0)
 
         version = getattr(self, "app_version", "V1.0")
-        update_date = getattr(self, "app_update_date", "2026-03-12")
+        update_date = getattr(self, "app_update_date", "2026-03-13")
 
         title = QLabel("关于限时福利彩金小助手")
         title.setStyleSheet("font-size:25px; font-weight:700; color:#1f2937;")
@@ -1128,7 +1128,17 @@ class UserWindow(QWidget):  # 主窗口类
 
                 for gid in id_list:
                     ws_all[f"A{all_row}"] = gid
-                    ws_all[f"B{all_row}"] = app_id_map.get(gid, '')
+
+                    # 将app_id转换为数字
+                    app_id_value = app_id_map.get(gid, '')
+                    try:
+                        if app_id_value and str(app_id_value).isdigit():
+                            ws_all[f"B{all_row}"] = int(app_id_value)
+                        else:
+                            ws_all[f"B{all_row}"] = app_id_value
+                    except (ValueError, TypeError):
+                        ws_all[f"B{all_row}"] = app_id_value
+
                     ws_all[f"C{all_row}"] = group
                     ws_all[f"D{all_row}"] = user_bets.get(gid, 0)
                     all_row += 1
@@ -1167,35 +1177,44 @@ class UserWindow(QWidget):  # 主窗口类
 
                 for gid in id_list:
                     bet_amount = user_bets.get(gid, 0)
+
+                    # 计算彩金 = 有效投注 × 比例（不四舍五入）
                     raw_bonus = bet_amount * bonus_rate
-                    bonus = round(raw_bonus)
 
-                    if bonus_min <= bonus <= bonus_max:
+                    # 获取并转换app_id
+                    app_id_value = app_id_map.get(gid, '')
+                    try:
+                        if app_id_value and str(app_id_value).isdigit():
+                            app_id_display = int(app_id_value)
+                        else:
+                            app_id_display = app_id_value
+                    except (ValueError, TypeError):
+                        app_id_display = app_id_value
+
+                    # ✅ 判断是否大于等于最低发放金额（不四舍五入）
+                    if raw_bonus >= bonus_min:
+                        # 再判断是否超过最高金额
+                        if raw_bonus <= bonus_max:
+                            final_bonus = raw_bonus  # 不超过最高，使用原始值
+                        else:
+                            final_bonus = bonus_max  # 超过最高，用最高金额
+
+                        # 写入记录
                         ws_bonus[f'A{bonus_row}'] = group
-                        ws_bonus[f'B{bonus_row}'] = app_id_map.get(gid, '')
-                        ws_bonus[f'C{bonus_row}'] = bonus
+                        ws_bonus[f'B{bonus_row}'] = app_id_display
+                        ws_bonus[f'C{bonus_row}'] = final_bonus  # 不四舍五入
                         ws_bonus[f'D{bonus_row}'] = audit_multiple
                         ws_bonus[f'E{bonus_row}'] = remark
                         ws_bonus[f'F{bonus_row}'] = remark
 
-                        total_bonus_amount += bonus
-                        bonus_count += 1
-                        bonus_row += 1
-                    elif bonus > bonus_max:
-                        ws_bonus[f'A{bonus_row}'] = group
-                        ws_bonus[f'B{bonus_row}'] = app_id_map.get(gid, '')
-                        ws_bonus[f'C{bonus_row}'] = bonus_max
-                        ws_bonus[f'D{bonus_row}'] = audit_multiple
-                        ws_bonus[f'E{bonus_row}'] = remark
-                        ws_bonus[f'F{bonus_row}'] = remark
-
-                        total_bonus_amount += bonus_max
+                        total_bonus_amount += final_bonus
                         bonus_count += 1
                         bonus_row += 1
 
+            # 在彩金sheet底部添加统计信息
             ws_bonus[f'A{bonus_row + 1}'] = '统计信息：'
             ws_bonus[f'A{bonus_row + 2}'] = f'发放人数：{bonus_count}'
-            ws_bonus[f'A{bonus_row + 3}'] = f'发放总彩金：{total_bonus_amount}元'
+            ws_bonus[f'A{bonus_row + 3}'] = f'发放总彩金：{total_bonus_amount:.2f}元'
 
             # —— 每个小组一个表 ——
             for group, id_list in self.group_game_ids.items():
@@ -1217,7 +1236,17 @@ class UserWindow(QWidget):  # 主窗口类
                 ws[f'A{3}'] = '详细数据列表：'
                 for i, gid in enumerate(id_list, start=4):
                     ws[f"A{i}"] = gid
-                    ws[f"B{i}"] = app_id_map.get(gid, '')
+
+                    # 将app_id转换为数字
+                    app_id_value = app_id_map.get(gid, '')
+                    try:
+                        if app_id_value and str(app_id_value).isdigit():
+                            ws[f"B{i}"] = int(app_id_value)
+                        else:
+                            ws[f"B{i}"] = app_id_value
+                    except (ValueError, TypeError):
+                        ws[f"B{i}"] = app_id_value
+
                     ws[f"C{i}"] = group
                     ws[f"D{i}"] = user_bets.get(gid, 0)
 
@@ -1233,7 +1262,7 @@ class UserWindow(QWidget):  # 主窗口类
             wb.save(file_name)
 
             QMessageBox.information(self, "提示",
-                                    f"数据已导出到 {file_name}\n彩金发放记录：{bonus_count}人，总计{total_bonus_amount}元")
+                                    f"数据已导出到 {file_name}\n彩金发放记录：{bonus_count}人，总计{total_bonus_amount:.2f}元")
             os.startfile(file_name)
 
         except Exception as e:
