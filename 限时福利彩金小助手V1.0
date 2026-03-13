@@ -1178,8 +1178,11 @@ class UserWindow(QWidget):  # 主窗口类
                 for gid in id_list:
                     bet_amount = user_bets.get(gid, 0)
 
-                    # 计算彩金 = 有效投注 × 比例（不四舍五入）
+                    # 计算彩金 = 有效投注 × 比例
                     raw_bonus = bet_amount * bonus_rate
+
+                    # ✅ 取整数部分（向下取整）
+                    bonus_int = int(raw_bonus)  # 直接取整数部分，舍弃小数
 
                     # 获取并转换app_id
                     app_id_value = app_id_map.get(gid, '')
@@ -1191,18 +1194,18 @@ class UserWindow(QWidget):  # 主窗口类
                     except (ValueError, TypeError):
                         app_id_display = app_id_value
 
-                    # ✅ 判断是否大于等于最低发放金额（不四舍五入）
-                    if raw_bonus >= bonus_min:
+                    # ✅ 判断整数部分是否大于等于最低发放金额
+                    if bonus_int >= bonus_min:
                         # 再判断是否超过最高金额
-                        if raw_bonus <= bonus_max:
-                            final_bonus = raw_bonus  # 不超过最高，使用原始值
+                        if bonus_int <= bonus_max:
+                            final_bonus = bonus_int  # 不超过最高，使用整数
                         else:
-                            final_bonus = bonus_max  # 超过最高，用最高金额
+                            final_bonus = int(bonus_max)  # 超过最高，用最高金额（转整数）
 
                         # 写入记录
                         ws_bonus[f'A{bonus_row}'] = group
                         ws_bonus[f'B{bonus_row}'] = app_id_display
-                        ws_bonus[f'C{bonus_row}'] = final_bonus  # 不四舍五入
+                        ws_bonus[f'C{bonus_row}'] = final_bonus  # 整数金额
                         ws_bonus[f'D{bonus_row}'] = audit_multiple
                         ws_bonus[f'E{bonus_row}'] = remark
                         ws_bonus[f'F{bonus_row}'] = remark
@@ -1214,7 +1217,7 @@ class UserWindow(QWidget):  # 主窗口类
             # 在彩金sheet底部添加统计信息
             ws_bonus[f'A{bonus_row + 1}'] = '统计信息：'
             ws_bonus[f'A{bonus_row + 2}'] = f'发放人数：{bonus_count}'
-            ws_bonus[f'A{bonus_row + 3}'] = f'发放总彩金：{total_bonus_amount:.2f}元'
+            ws_bonus[f'A{bonus_row + 3}'] = f'发放总彩金：{total_bonus_amount}元'  # 整数不用格式化小数
 
             # —— 每个小组一个表 ——
             for group, id_list in self.group_game_ids.items():
@@ -1262,7 +1265,7 @@ class UserWindow(QWidget):  # 主窗口类
             wb.save(file_name)
 
             QMessageBox.information(self, "提示",
-                                    f"数据已导出到 {file_name}\n彩金发放记录：{bonus_count}人，总计{total_bonus_amount:.2f}元")
+                                    f"数据已导出到 {file_name}\n彩金发放记录：{bonus_count}人，总计{total_bonus_amount}元")
             os.startfile(file_name)
 
         except Exception as e:
