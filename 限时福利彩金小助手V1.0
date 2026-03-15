@@ -10,8 +10,9 @@ from PyQt5.QtGui import QFont, QPixmap, QIcon
 from concurrent.futures import ThreadPoolExecutor, as_completed  # 在文件开头导入
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from PyQt5.QtCore import QThreadPool, QDateTime, QByteArray, QTime, QDate, QMutex, QSize, QRunnable, pyqtSignal, QObject, \
-    QTimer, Qt
+from PyQt5.QtCore import QThreadPool, QDateTime, QByteArray, QTime, QDate, QMutex, QSize, QRunnable, pyqtSignal, \
+    QObject, \
+    QTimer, Qt, QMutexLocker
 from configparser import ConfigParser
 from PyQt5.QtWidgets import QApplication, QMessageBox, QDateTimeEdit, \
     QListWidget, QStackedWidget, QProgressBar, QGroupBox, QGridLayout, QListWidgetItem, \
@@ -125,7 +126,6 @@ class DataWorker(QRunnable):  # 数据处理线程
 
     def run(self):
         try:
-            print(f"🟢 正在获取 [{self.group_name}] 游戏总人数及有效投注")
             headers = {
                 'Cookie': f'token={self.token}',
             }
@@ -299,9 +299,16 @@ class UserWindow(QWidget):  # 主窗口类
         self.group_raw_counts = {}  # 保存每个小组的原始条数
         self.current_group = ""
 
+        # 新增：任务状态管理（优化点1）
+        self.task_status = {}  # {group_name: {"status": "pending/running/completed/failed/skipped", "started": bool}}
+        self.task_results = {}  # {group_name: {"game_ids": [], "user_bets": {}, "app_id_map": {}}}
+        self.status_lock = QMutex()  # 保护状态更新的锁
+        self.pending_groups = []  # 待启动的小组（有Cookie的）
+        self.started_groups = set()  # 已实际启动的小组（用于跟踪）
+
         # 不限并发：用于总体进度
-        self.total_groups = 0
-        self.completed_groups = 0
+        self.total_groups = 0  # 真正要运行的小组数量（排除跳过的）
+        self.completed_groups = 0  # 已完成的小组数量（包含成功和失败）
 
         # 设置主窗口样式
         self.setStyleSheet("""
@@ -365,7 +372,6 @@ class UserWindow(QWidget):  # 主窗口类
         self.nav_list = QListWidget()
         self.nav_list.setFixedWidth(200)
         self.nav_list.setFont(QFont("Microsoft YaHei", 11))
-
         # 设置导航栏样式
         self.nav_list.setStyleSheet("""
                     QListWidget {
@@ -454,6 +460,21 @@ class UserWindow(QWidget):  # 主窗口类
 
     def switch_page(self, index):
         self.pages.setCurrentIndex(index)
+
+    def reset_task_state(self):
+        """重置所有任务状态"""
+        with QMutexLocker(self.status_lock):
+            self.task_status.clear()
+            self.task_results.clear()
+            self.pending_groups = []
+            self.started_groups.clear()
+            self.group_game_ids.clear()
+            self.group_user_bets.clear()
+            self.group_app_id_maps.clear()
+            self.group_raw_counts.clear()
+            self.workers.clear()
+            self.completed_groups = 0
+            self.total_groups = 0
 
     def setup_data_tab(self):  # 数据获取页面
         layout = QVBoxLayout()
@@ -735,7 +756,36 @@ class UserWindow(QWidget):  # 主窗口类
     def on_schedule_trigger(self, time_str):
         """定时任务触发"""
         print(f"⏰ 定时任务触发 [{time_str}]")
+
+        # 检查是否有正在运行的任务（优化点：避免重复触发）
+        with QMutexLocker(self.status_lock):
+            running_tasks = []
+            pending_tasks = []
+            for group, status_info in self.task_status.items():
+                if status_info["status"] in ["pending", "running"]:
+                    if status_info["status"] == "running":
+                        running_tasks.append(group)
+                    else:
+                        pending_tasks.append(group)
+
+            if running_tasks or pending_tasks:
+                warning_msg = []
+                if running_tasks:
+                    warning_msg.append(f"运行中: {', '.join(running_tasks)}")
+                if pending_tasks:
+                    warning_msg.append(f"等待中: {', '.join(pending_tasks)}")
+
+                print(f"⚠️ 有正在运行的任务：{'；'.join(warning_msg)}，跳过本次定时触发")
+                self.status_label.setText(f"状态：上次任务未完成，跳过定时 [{time_str}]")
+
+                # 可选：弹出提示（根据需要决定是否启用）
+                # QMessageBox.warning(self, "定时任务", f"上次任务尚未完成，跳过本次定时触发\n{'；'.join(warning_msg)}")
+                return
+
         self.status_label.setText(f"状态：定时任务触发 [{time_str}]")
+
+        # 强制重置所有状态（优化点：确保每次定时任务都是全新开始）
+        self.reset_task_state()
 
         # 设置为当日日期
         self.set_default_dates()
@@ -944,11 +994,8 @@ class UserWindow(QWidget):  # 主窗口类
         self.end_time_input.setDateTime(QDateTime(date, QTime(23, 59, 59)))
 
     def start_processing(self):
-        self.group_game_ids = {}
-        self.group_user_bets = {}
-        self.group_app_id_maps = {}
-        self.group_raw_counts = {}
-        self.workers = []
+        # 重置所有状态（优化点：确保每次开始都是全新的状态）
+        self.reset_task_state()
 
         port = self.port_input.text().strip()
         code = self.code_input.text().strip()
@@ -976,12 +1023,18 @@ class UserWindow(QWidget):  # 主窗口类
 
         groups_to_run = []
         skipped = []
+
+        # 收集有 Cookie 的小组并初始化状态
         for g in list(self.token_inputs.keys()):
             token = self.token_inputs[g].text().strip()
             if token:
                 groups_to_run.append(g)
+                # 初始化任务状态（优化点：为每个任务设置初始状态）
+                self.task_status[g] = {"status": "pending", "started": False}
             else:
                 skipped.append(g)
+                # 跳过的也记录状态（优化点：记录跳过的小组，避免干扰完成判断）
+                self.task_status[g] = {"status": "skipped", "started": False}
 
         if not groups_to_run:
             QMessageBox.warning(self, "警告", "没有任何小组填写 Cookie，无法开始！")
@@ -989,10 +1042,14 @@ class UserWindow(QWidget):  # 主窗口类
 
         if skipped:
             print("⚠️ 以下小组未填写 Cookie，已跳过：", "、".join(skipped))
+            self.status_label.setText(f"状态：已跳过 {len(skipped)} 个无Cookie的小组")
 
+        # 设置线程池大小
         self.thread_pool.setMaxThreadCount(len(groups_to_run))
 
-        self.total_groups = len(groups_to_run)
+        # 保存待启动列表（优化点：保存待启动的小组列表）
+        self.pending_groups = groups_to_run.copy()
+        self.total_groups = len(groups_to_run)  # 只计数真正要运行的小组
         self.completed_groups = 0
 
         self.status_label.setText(f"状态：准备开始…（共 {self.total_groups} 个小组，同时并发）")
@@ -1001,16 +1058,35 @@ class UserWindow(QWidget):  # 主窗口类
 
         self.disable_ui()
 
+        # 错峰启动所有小组（优化点：使用闭包捕获group的当前值）
         for group in groups_to_run:
             delay = random.randint(0, STAGGER_MAX_MS)
             print(f"🚀 准备启动小组 [{group}]，错峰延迟 {delay}ms")
+            # 使用默认参数捕获group的当前值，避免lambda闭包问题
             QTimer.singleShot(delay, lambda g=group: self._start_worker(g, port, code, start_time, end_time))
 
     def _start_worker(self, group, port, code, start_time, end_time):
+        # 检查是否已被取消或已完成（优化点：避免重复启动）
+        with QMutexLocker(self.status_lock):
+            if group not in self.task_status:
+                print(f"⚠️ 小组 [{group}] 状态不存在，可能已被重置")
+                return
+            if self.task_status[group]["status"] in ["completed", "failed", "skipped"]:
+                print(f"⚠️ 小组 [{group}] 已处于 {self.task_status[group]['status']} 状态，跳过启动")
+                return
+
+            # 标记为已启动
+            self.task_status[group]["status"] = "running"
+            self.task_status[group]["started"] = True
+            self.started_groups.add(group)
+
         token = self.token_inputs[group].text().strip()
         if not token:
             print(f"⚠️ 小组 [{group}] 启动时发现 Cookie 为空，跳过")
-            self._mark_group_done(group, f"[{group}] Cookie 为空，已跳过")
+            with QMutexLocker(self.status_lock):
+                self.task_status[group]["status"] = "skipped"
+            # 使用新的完成检查方法
+            self._check_all_tasks_complete(group, f"[{group}] Cookie 为空，已跳过")
             return
 
         self.current_group = group
@@ -1020,6 +1096,7 @@ class UserWindow(QWidget):  # 主窗口类
         worker = DataWorker(signals, port, token, code, start_time, end_time, group_name=group)
         self.workers.append(worker)
 
+        # 连接信号
         signals.finished.connect(self.on_task_finished)
         signals.data_ready.connect(self.on_data_ready)
         signals.progress.connect(self.update_progress)
@@ -1029,6 +1106,72 @@ class UserWindow(QWidget):  # 主窗口类
 
         self.thread_pool.start(worker)
         print(f"🧵 已启动任务：[{group}]")
+
+    def _check_all_tasks_complete(self, group_name=None, message=None):
+        """检查是否所有任务都已完成"""
+        # 先在不加锁的情况下获取需要的数据
+        task_status_copy = {}
+        with QMutexLocker(self.status_lock):
+            # 复制一份状态数据，避免在锁外访问
+            task_status_copy = {k: v.copy() for k, v in self.task_status.items()}
+
+        # 统计各种状态的任务数量（在锁外进行）
+        completed_count = 0
+        failed_count = 0
+        skipped_count = 0
+        running_count = 0
+        pending_count = 0
+
+        for group, status_info in task_status_copy.items():
+            status = status_info["status"]
+            if status == "completed":
+                completed_count += 1
+            elif status == "failed":
+                failed_count += 1
+            elif status == "skipped":
+                skipped_count += 1
+            elif status == "running":
+                running_count += 1
+            elif status == "pending":
+                pending_count += 1
+
+        # 更新进度条（需要在主线程）
+        total_active = completed_count + failed_count + running_count + pending_count
+        if total_active > 0:
+            percent = int(((completed_count + failed_count) / total_active) * 100)
+            # 使用信号或直接在主线程更新UI
+            self.progress_bar.setValue(max(0, min(100, percent)))
+
+        # 检查是否所有活动任务都已完成
+        all_complete = (running_count == 0 and pending_count == 0)
+
+        if all_complete:
+            print(f"📊 统计：完成 {completed_count}，失败 {failed_count}，跳过 {skipped_count}")
+            # 使用 QTimer.singleShot 延迟调用，避免在锁的上下文中
+            QTimer.singleShot(100, self._on_all_tasks_complete)
+
+    def _on_all_tasks_complete(self):
+        """所有任务完成的处理"""
+        print("🎉 所有小组任务完成！")
+
+        # 先恢复UI（必须在主线程）
+        self.enable_ui()
+        self.progress_bar.setVisible(False)
+
+        # 使用 QTimer 延迟弹窗，给UI一点时间恢复
+        QTimer.singleShot(200, self._show_completion_dialog)
+
+    def _show_completion_dialog(self):
+        """单独的方法显示完成对话框"""
+        try:
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("完成")
+            msg_box.setText("所有小组数据已处理完毕！")
+            msg_box.setIcon(QMessageBox.Information)
+            msg_box.setWindowFlags(msg_box.windowFlags() | Qt.WindowStaysOnTopHint)
+            msg_box.exec_()
+        except Exception as e:
+            print(f"弹窗显示失败: {e}")
 
     def on_appid_progress(self, group_name, current, total):
         percent = int((current / total) * 100)
@@ -1050,7 +1193,7 @@ class UserWindow(QWidget):  # 主窗口类
         self.group_game_ids[group_name] = game_ids
         self.group_user_bets[group_name] = user_bets
         self.group_app_id_maps[group_name] = app_id_map
-        print(f"📦 已保存 [{group_name}] 的游戏总人数 {len(game_ids)} 个，投注数据已保存，app_id {len(app_id_map)} 个")
+        # print(f"📦 已保存 [{group_name}] 的游戏总人数 {len(game_ids)} 个，投注数据已保存，app_id {len(app_id_map)} 个")
 
     def _mark_group_done(self, group_name, message):
         # 统一完成逻辑（用于跳过/异常也能计入总体完成）
@@ -1076,8 +1219,24 @@ class UserWindow(QWidget):  # 主窗口类
             QTimer.singleShot(500, lambda: self.progress_bar.setVisible(False))
 
     def on_task_finished(self, group_name, message):
-        print(message)
-        self._mark_group_done(group_name, message)
+        """任务完成信号处理"""
+        # 先更新状态（需要锁）
+        with QMutexLocker(self.status_lock):
+            if group_name in self.task_status:
+                if "错误" in message or "失败" in message or "异常" in message:
+                    self.task_status[group_name]["status"] = "failed"
+                    print(f"❌ 小组 [{group_name}] 失败")
+                else:
+                    self.task_status[group_name]["status"] = "completed"
+                    # 可以在这里保存一些统计信息
+                    if group_name in self.group_game_ids:
+                        user_count = len(self.group_game_ids[group_name])
+                        # print(f"✅ 小组 [{group_name}] 完成 ({user_count}人)")
+                    else:
+                        print(f"✅ 小组 [{group_name}] 完成")
+
+        # 检查完成状态（不需要在锁内进行）
+        self._check_all_tasks_complete(group_name, message)
 
     def export_data(self):
         if not self.group_game_ids:
@@ -1096,6 +1255,82 @@ class UserWindow(QWidget):  # 主窗口类
                 QMessageBox.warning(self, "警告", "彩金配置格式错误，请填写数字！")
                 return
 
+            # 获取桌面路径
+            desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+            rq = datetime.now().strftime('%m%d_%H%M%S')
+
+            # ===== 1. 先创建彩金发放记录文件 =====
+            bonus_wb = Workbook()
+            bonus_ws = bonus_wb.active
+            bonus_ws.title = "彩金发放记录"
+
+            # 设置表头
+            bonus_ws['A1'] = '归属'
+            bonus_ws['B1'] = '会员ID'
+            bonus_ws['C1'] = '奖励金额(必填)'
+            bonus_ws['D1'] = '稽核倍数(必填)'
+            bonus_ws['E1'] = '前台备注'
+            bonus_ws['F1'] = '后台备注'
+
+            # 设置列宽
+            bonus_ws.column_dimensions['A'].width = 12
+            bonus_ws.column_dimensions['B'].width = 20
+            bonus_ws.column_dimensions['C'].width = 15
+            bonus_ws.column_dimensions['D'].width = 12
+            bonus_ws.column_dimensions['E'].width = 15
+            bonus_ws.column_dimensions['F'].width = 15
+
+            bonus_row = 2
+            total_bonus_amount = 0
+            bonus_count = 0
+
+            # 计算彩金发放数据
+            for group, id_list in self.group_game_ids.items():
+                user_bets = self.group_user_bets.get(group, {})
+                app_id_map = self.group_app_id_maps.get(group, {})
+
+                for gid in id_list:
+                    bet_amount = user_bets.get(gid, 0)
+
+                    # 计算彩金 = 有效投注 × 比例
+                    raw_bonus = bet_amount * bonus_rate
+                    bonus_int = int(raw_bonus)  # 直接取整数部分，舍弃小数
+
+                    # 获取并转换app_id
+                    app_id_value = app_id_map.get(gid, '')
+                    try:
+                        if app_id_value and str(app_id_value).isdigit():
+                            app_id_display = int(app_id_value)
+                        else:
+                            app_id_display = app_id_value
+                    except (ValueError, TypeError):
+                        app_id_display = app_id_value
+
+                    # 判断是否发放彩金
+                    if bonus_int >= bonus_min:
+                        if bonus_int <= bonus_max:
+                            final_bonus = bonus_int
+                        else:
+                            final_bonus = int(bonus_max)
+
+                        # 写入记录
+                        bonus_ws[f'A{bonus_row}'] = group
+                        bonus_ws[f'B{bonus_row}'] = app_id_display
+                        bonus_ws[f'C{bonus_row}'] = final_bonus
+                        bonus_ws[f'D{bonus_row}'] = audit_multiple
+                        bonus_ws[f'E{bonus_row}'] = remark
+                        bonus_ws[f'F{bonus_row}'] = remark
+
+                        total_bonus_amount += final_bonus
+                        bonus_count += 1
+                        bonus_row += 1
+
+            # 保存彩金发放记录到桌面
+            bonus_file_name = f'限时福利彩金_{rq}.xlsx'
+            bonus_file_path = os.path.join(desktop_path, bonus_file_name)
+            bonus_wb.save(bonus_file_path)
+
+            # ===== 2. 创建数据统计文件（保持不变） =====
             wb = Workbook()
             wb.remove(wb.active)
 
@@ -1129,7 +1364,6 @@ class UserWindow(QWidget):  # 主窗口类
                 for gid in id_list:
                     ws_all[f"A{all_row}"] = gid
 
-                    # 将app_id转换为数字
                     app_id_value = app_id_map.get(gid, '')
                     try:
                         if app_id_value and str(app_id_value).isdigit():
@@ -1149,75 +1383,6 @@ class UserWindow(QWidget):  # 主窗口类
             ws_all.column_dimensions['D'].width = 15
             ws_all.column_dimensions['F'].width = 12
             ws_all.column_dimensions['G'].width = 12
-
-            # —— 彩金发放记录sheet ——
-            ws_bonus = wb.create_sheet(title="彩金发放记录")
-
-            ws_bonus['A1'] = '归属'
-            ws_bonus['B1'] = '会员ID'
-            ws_bonus['C1'] = '奖励金额(必填)'
-            ws_bonus['D1'] = '稽核倍数(必填)'
-            ws_bonus['E1'] = '前台备注'
-            ws_bonus['F1'] = '后台备注'
-
-            ws_bonus.column_dimensions['A'].width = 12
-            ws_bonus.column_dimensions['B'].width = 20
-            ws_bonus.column_dimensions['C'].width = 15
-            ws_bonus.column_dimensions['D'].width = 12
-            ws_bonus.column_dimensions['E'].width = 15
-            ws_bonus.column_dimensions['F'].width = 15
-
-            bonus_row = 2
-            total_bonus_amount = 0
-            bonus_count = 0
-
-            for group, id_list in self.group_game_ids.items():
-                user_bets = self.group_user_bets.get(group, {})
-                app_id_map = self.group_app_id_maps.get(group, {})
-
-                for gid in id_list:
-                    bet_amount = user_bets.get(gid, 0)
-
-                    # 计算彩金 = 有效投注 × 比例
-                    raw_bonus = bet_amount * bonus_rate
-
-                    # ✅ 取整数部分（向下取整）
-                    bonus_int = int(raw_bonus)  # 直接取整数部分，舍弃小数
-
-                    # 获取并转换app_id
-                    app_id_value = app_id_map.get(gid, '')
-                    try:
-                        if app_id_value and str(app_id_value).isdigit():
-                            app_id_display = int(app_id_value)
-                        else:
-                            app_id_display = app_id_value
-                    except (ValueError, TypeError):
-                        app_id_display = app_id_value
-
-                    # ✅ 判断整数部分是否大于等于最低发放金额
-                    if bonus_int >= bonus_min:
-                        # 再判断是否超过最高金额
-                        if bonus_int <= bonus_max:
-                            final_bonus = bonus_int  # 不超过最高，使用整数
-                        else:
-                            final_bonus = int(bonus_max)  # 超过最高，用最高金额（转整数）
-
-                        # 写入记录
-                        ws_bonus[f'A{bonus_row}'] = group
-                        ws_bonus[f'B{bonus_row}'] = app_id_display
-                        ws_bonus[f'C{bonus_row}'] = final_bonus  # 整数金额
-                        ws_bonus[f'D{bonus_row}'] = audit_multiple
-                        ws_bonus[f'E{bonus_row}'] = remark
-                        ws_bonus[f'F{bonus_row}'] = remark
-
-                        total_bonus_amount += final_bonus
-                        bonus_count += 1
-                        bonus_row += 1
-
-            # 在彩金sheet底部添加统计信息
-            ws_bonus[f'A{bonus_row + 1}'] = '统计信息：'
-            ws_bonus[f'A{bonus_row + 2}'] = f'发放人数：{bonus_count}'
-            ws_bonus[f'A{bonus_row + 3}'] = f'发放总彩金：{total_bonus_amount}元'  # 整数不用格式化小数
 
             # —— 每个小组一个表 ——
             for group, id_list in self.group_game_ids.items():
@@ -1240,7 +1405,6 @@ class UserWindow(QWidget):  # 主窗口类
                 for i, gid in enumerate(id_list, start=4):
                     ws[f"A{i}"] = gid
 
-                    # 将app_id转换为数字
                     app_id_value = app_id_map.get(gid, '')
                     try:
                         if app_id_value and str(app_id_value).isdigit():
@@ -1260,16 +1424,25 @@ class UserWindow(QWidget):  # 主窗口类
                 ws.column_dimensions['F'].width = 12
                 ws.column_dimensions['G'].width = 12
 
-            rq = datetime.now().strftime('%Y年%m月%d日%H时%M分%S秒')
-            file_name = f'多小组游戏数据统计_{rq}.xlsx'
-            wb.save(file_name)
+            # 保存数据统计文件到当前目录
+            data_file_name = f'多小组游戏数据统计_{rq}.xlsx'
+            wb.save(data_file_name)
 
+            # 弹出提示信息
             QMessageBox.information(self, "提示",
-                                    f"数据已导出到 {file_name}\n彩金发放记录：{bonus_count}人，总计{total_bonus_amount}元")
-            os.startfile(file_name)
+                                    f"✅ 数据已导出：\n"
+                                    f"📈 彩金发放：{bonus_count}人，总计{total_bonus_amount}元")
+
+            # 打开数据统计文件
+            os.startfile(data_file_name)
+            os.startfile(bonus_file_path)
+
+            # 可选：也打开彩金记录文件
+            # os.startfile(bonus_file_path)
 
         except Exception as e:
             QMessageBox.warning(self, "警告", f"导出数据失败: {e}")
+            print(f"导出异常: {e}")
 
     def disable_ui(self):
         self.start_time_input.setEnabled(False)
@@ -1390,7 +1563,7 @@ class UserWindow(QWidget):  # 主窗口类
             try:
                 config.read('config.ini', encoding=encoding)
                 file_read = True
-                print(f"配置文件使用 {encoding} 编码读取成功")
+                # print(f"配置文件使用 {encoding} 编码读取成功")
                 break
             except UnicodeDecodeError:
                 continue
