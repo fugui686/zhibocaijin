@@ -837,29 +837,28 @@ class 波币处理器:
                 error_msg = self.致命错误信息 or "端口或code配置错误"
                 raise Exception(error_msg)
 
-        # 使用进程池并发处理小组
-        with ProcessPoolExecutor(max_workers=min(20, len(self.groups))) as executor:
-            # 准备进程池任务
+        # 使用线程池并发处理小组（改为 ThreadPoolExecutor）
+        with ThreadPoolExecutor(max_workers=min(20, len(self.groups))) as executor:
+            # 准备线程池任务
             future_to_group = {}
             for group in self.groups:
                 小组名 = group.get("group_name", "").strip()
                 cookie = group.get("cookie", "").strip()
                 payment_class_id = group.get("payment_class_id", "").strip()
+                holiday_mode = group.get("holiday_mode", False)  # 获取节日模式状态
 
                 if not 小组名 or not cookie or not payment_class_id:
                     continue
 
                 self.log(f"提交小组任务：{小组名}")
-                # 每个进程需要独立的处理器实例
+                # 直接调用 self.处理小组，不需要传递那么多参数
                 future = executor.submit(
-                    self._处理小组进程,
-                    self.port, self.code, 小组名, cookie, payment_class_id,
-                    self.开始日期, self.结束日期, self.模式,
-                    group.get("holiday_mode", False)  # 新增：传递节日模式状态
+                    self.处理小组,
+                    小组名, cookie, payment_class_id, holiday_mode
                 )
                 future_to_group[future] = 小组名
 
-            # 收集进程结果
+            # 收集线程结果
             for future in as_completed(future_to_group):
                 小组名 = future_to_group[future]
                 try:
@@ -895,20 +894,6 @@ class 波币处理器:
             "赠送条数": len(赠送结果),
             "失败小组": 失败小组
         }
-
-    @staticmethod
-    def _处理小组进程(port, code, 小组名, cookie, payment_class_id, 开始日期, 结束日期, 模式, holiday_mode=False):
-        """静态方法：在独立进程中处理小组"""
-        processor = 波币处理器(
-            port=port,
-            code=code,
-            groups=[],  # 不需要groups
-            开始日期=开始日期,
-            结束日期=结束日期,
-            模式=模式
-        )
-        # 需要把 holiday_mode 传给处理小组的方法
-        return processor.处理小组(小组名, cookie, payment_class_id, holiday_mode)
 
 
 class Worker(QObject):
